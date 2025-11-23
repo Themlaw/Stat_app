@@ -7,7 +7,8 @@ import numpy as np
 # -------------------------------------------------------------------
 # 1. Chargement des liens causaux structurés
 # -------------------------------------------------------------------
-LINKS_PATH = Path("../ressources/causal_dag_structured.csv")
+SCRIPT_DIR = Path(__file__).parent
+LINKS_PATH = SCRIPT_DIR / "../ressources/causal_dag_structured.csv"
 
 if not LINKS_PATH.exists():
     raise FileNotFoundError(f"Le fichier {LINKS_PATH} n'existe pas. Exécutez d'abord analyze_covid_data_advanced.py")
@@ -209,7 +210,7 @@ ax.axis('off')
 plt.tight_layout()
 
 # Sauvegarde
-output_path = Path("../ressources/causal_dag_simple.png")
+output_path = SCRIPT_DIR / "../ressources/causal_dag_simple.png"
 plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
 print(f"✅ DAG sauvegardé dans {output_path}")
 
@@ -280,7 +281,7 @@ stats_df = pd.DataFrame([
     {"metric": "Variables influençant OS", "value": len(direct_causes) if os_final else 0},
 ])
 
-stats_df.to_csv("../ressources/causal_dag_stats.csv", index=False, encoding='utf-8-sig')
+stats_df.to_csv(SCRIPT_DIR / "../ressources/causal_dag_stats.csv", index=False, encoding='utf-8-sig')
 print(f"\n✅ Statistiques exportées dans ../ressources/causal_dag_stats.csv")
 
 # Export de la table des chemins
@@ -288,7 +289,7 @@ if os_final and "Vaccine100" in G_filtered.nodes():
     try:
         paths = list(nx.all_simple_paths(G_filtered, "Vaccine100", os_final, cutoff=5))
         paths_df = pd.DataFrame([{"path": " → ".join(p), "length": len(p)-1} for p in paths])
-        paths_df.to_csv("../ressources/vaccine_to_os_paths.csv", index=False, encoding='utf-8-sig')
+        paths_df.to_csv(SCRIPT_DIR / "../ressources/vaccine_to_os_paths.csv", index=False, encoding='utf-8-sig')
         print(f"✅ Chemins Vaccine100→OS exportés dans ../ressources/vaccine_to_os_paths.csv")
     except:
         pass
