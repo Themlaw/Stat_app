@@ -23,14 +23,15 @@ HORIZONTAL_SPACING = 6.0
 VERTICAL_SPACING = 3.0
 LABEL_FONT_SIZE = 9
 
+# Épaisseur des arêtes (sera pondérée par les coefficients)
+EDGE_WIDTH_MIN = 1.5
+EDGE_WIDTH_MAX = 6.0
+EDGE_ALPHA = 0.8
+
 # Styles
 EDGE_COLOR = "#2E86AB"
 NODE_FACE_COLORS = ['#f4a261','#2a9d8f','#264653','#e9c46a','#e76f51'] 
 RED_HIGHLIGHT = "#D62828"
-
-# --- CHANGEMENT ICI : Épaisseur et Opacité constantes ---
-FIXED_EDGE_WIDTH = 2.0  # Toutes les flèches auront cette épaisseur
-FIXED_EDGE_ALPHA = 0.8  # Transparence légère
 
 # -------------------------------------------------------------------
 # 1. Chargement & Nettoyage
@@ -76,13 +77,25 @@ links_clean['required_score'] = BASE_THRESHOLD + (JUMP_PENALTY * (links_clean['j
 # Graphe COMPLET (Sans filtre)
 G_full = nx.DiGraph()
 for _, r in links_clean.iterrows():
-    G_full.add_edge(r['from'], r['to'], weight=r['relative_importance'])
+    G_full.add_edge(
+        r['from'],
+        r['to'],
+        weight=r['relative_importance'],
+        coef=r['coef'],
+        abs_coef=abs(r['coef'])
+    )
 
 # Graphe FILTRÉ (Smart Filter)
 links_filtered = links_clean[links_clean['relative_importance'] >= links_clean['required_score']].copy()
 G_smart = nx.DiGraph()
 for _, r in links_filtered.iterrows():
-    G_smart.add_edge(r['from'], r['to'], weight=r['relative_importance'])
+    G_smart.add_edge(
+        r['from'],
+        r['to'],
+        weight=r['relative_importance'],
+        coef=r['coef'],
+        abs_coef=abs(r['coef'])
+    )
 
 print(f"📊 Liens totaux (G_full) : {G_full.number_of_edges()}")
 print(f"📊 Liens filtrés (G_smart): {G_smart.number_of_edges()}")
@@ -144,15 +157,23 @@ def draw_dag(graph, title, output_path, show=False):
             txt_col = 'black'
         
         t = ax.text(pos[node][0], pos[node][1], str(node),
-                    fontsize=LABEL_FONT_SIZE, fontweight='bold', color=txt_col,
+                    fontsize=LABEL_FONT_SIZE + 3, fontweight='bold', color=txt_col,
                     ha='center', va='center',
-                    bbox=dict(boxstyle="round,pad=0.5", facecolor=color, edgecolor='black', linewidth=1),
+                    bbox=dict(boxstyle="round,pad=0.65", facecolor=color, edgecolor='black', linewidth=1.2),
                     zorder=10)
         node_artists[node] = t
 
-    # B. DESSINER LES ARÊTES (ÉPAISSEUR CONSTANTE)
+    # B. DESSINER LES ARÊTES (ÉPAISSEUR PONDÉRÉE)
+    edge_strengths = [abs(data.get('coef', data.get('weight', 0))) for _, _, data in graph.edges(data=True)]
+    max_strength = max(edge_strengths) if edge_strengths else 0
+
     for u, v in graph.edges():
         if u not in pos or v not in pos: continue
+
+        data = graph.get_edge_data(u, v, default={})
+        strength = abs(data.get('coef', data.get('weight', 0)))
+        normalized = (strength / max_strength) if max_strength else 0
+        linewidth = EDGE_WIDTH_MIN + (EDGE_WIDTH_MAX - EDGE_WIDTH_MIN) * normalized
         
         ax.annotate("", 
                     xy=pos[v], xycoords='data',
@@ -160,8 +181,8 @@ def draw_dag(graph, title, output_path, show=False):
                     arrowprops=dict(
                         arrowstyle="-|>,head_length=0.8,head_width=0.5",
                         color=EDGE_COLOR, 
-                        alpha=FIXED_EDGE_ALPHA,    # <--- Constance
-                        linewidth=FIXED_EDGE_WIDTH,# <--- Constance
+                        alpha=EDGE_ALPHA,
+                        linewidth=linewidth,
                         connectionstyle="arc3,rad=0.1",
                         patchB=node_artists[v], 
                         patchA=node_artists[u]

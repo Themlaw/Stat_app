@@ -16,7 +16,7 @@ SHEETS_TO_LOAD = [
     "1d Raw Data",
 ]
 
-OUTPUT_PATH = SCRIPT_DIR / "../ressources/combined_covid_data.csv"
+OUTPUT_PATH = SCRIPT_DIR / "../data/combined_covid_data.csv"
 
 # Options de gestion des valeurs manquantes :
 # "keep" : garde toutes les lignes et colonnes (par défaut)
