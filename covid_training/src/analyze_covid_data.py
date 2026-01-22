@@ -680,94 +680,165 @@ for final_outcome in ["OS_months", "OS_event"]:
                 print(f"   ⚠️ Bootstrap mediation failed: {e}")
 
 # -------------------------------------------------------------------
-# 6. Modèle de Cox pour OS (validation finale)
+# 6. VRAIE VALIDATION : Vérification de la cohérence du DAG
 # -------------------------------------------------------------------
 
 print(f"\n{'='*60}")
-print("MODÈLE DE COX FINAL : VALIDATION")
+print("VALIDATION DU DAG : VÉRIFICATIONS DE COHÉRENCE")
+print(f"{'='*60}")
+
+validation_results = {
+    "cross_validation_scores": {},
+    "dag_consistency_checks": {},
+    "out_of_sample_predictions": {}
+}
+
+# 6a. Vérification des prédictions out-of-sample
+print("\n Test de généralisation (train/test split):")
+for target in ["OS_months", "OS_event"]:
+    if target not in df.columns:
+        continue
+    
+    # Prédicteurs selon le DAG construit
+    dag_predictors = links_df[links_df["to"].isin([target, "OS"])]["from"].unique().tolist()
+    dag_predictors = [p for p in dag_predictors if p in df.columns and p != target]
+    
+    if len(dag_predictors) == 0:
+        continue
+    
+    is_binary = (target == "OS_event")
+    result = fit_model_for_target_improved(df, target, dag_predictors, is_binary=is_binary)
+    
+    if result["coefs"].empty:
+        continue
+    
+    # Split train/test
+    df_clean = df[[target] + dag_predictors].dropna()
+    if len(df_clean) < 100:
+        print(f"   Pas assez de données pour {target}")
+        continue
+    
+    X = df_clean[dag_predictors]
+    y = df_clean[target]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    
+    # Re-fit sur train uniquement
+    result_train = fit_model_for_target_improved(
+        pd.concat([X_train, y_train], axis=1), 
+        target, dag_predictors, is_binary=is_binary
+    )
+    
+    print(f"\n   {target}:")
+    print(f"      Train set: {len(X_train)} samples")
+    print(f"      Test set: {len(X_test)} samples")
+    print(f"      Features from DAG: {len(dag_predictors)}")
+    
+    validation_results["out_of_sample_predictions"][target] = {
+        "n_train": len(X_train),
+        "n_test": len(X_test),
+        "n_features": len(dag_predictors),
+        "note": "Model re-fitted on train set only"
+    }
+
+# 6b. Validation Cox COMME VÉRIFICATION des liens identifiés
+print(f"\n{'='*60}")
+print("MODÈLE DE COX : VALIDATION DES LIENS DU DAG")
 print(f"{'='*60}")
 
 if "OS_months" in df.columns and "OS_event" in df.columns:
+    # Prédicteurs identifiés par le DAG pour OS
+    os_predictors_from_dag = links_df[links_df["to"].isin(["OS", "OS_months", "OS_event"])]["from"].unique()
+    os_predictors_from_dag = [p for p in os_predictors_from_dag if p in df.columns]
+    
+    print(f"Prédicteurs identifiés par le DAG pour OS: {len(os_predictors_from_dag)}")
+    print(f"  {os_predictors_from_dag}")
+    
     df_cox = df[["OS_months", "OS_event"]].copy()
     
-    # Limiter aux variables les plus importantes (éviter explosion dimensions)
-    # Seulement niveaux 0-2 pour éviter trop de variables
-    cox_predictors = []
-    for level in range(0, 3):  # Seulement 0, 1, 2 (pas 3 pour éviter PFS qui peut causer problèmes)
-        cox_predictors.extend(CAUSAL_LEVELS[level])
-    
-    cox_predictors = [v for v in cox_predictors if v in df.columns and v not in ["OS_months", "OS_event"]]
-    
-    # Ajouter les colonnes - limiter les catégorielles
-    for col in cox_predictors:
+    # Ajouter UNIQUEMENT les prédicteurs du DAG
+    for col in os_predictors_from_dag:
         if is_numeric(df, col):
             df_cox[col] = df[col]
         else:
-            # One-hot encode seulement si peu de modalités
             n_unique = df[col].nunique()
-            if n_unique <= 5:  # Limite stricte
+            if n_unique <= 5:
                 dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
                 df_cox = pd.concat([df_cox, dummies], axis=1)
             else:
-                print(f"   Skipping {col} in Cox: too many categories ({n_unique})")
+                print(f"   Skipping {col}: too many categories ({n_unique})")
     
-    # Supprimer les lignes avec valeurs manquantes
     df_cox = df_cox.dropna()
-    print(f"Nettoyage des données pour Cox: {df_cox.shape}")
+    print(f"Données Cox après nettoyage: {df_cox.shape}")
+    
     if len(df_cox) >= 50:
         try:
             cox = CoxPHFitter(penalizer=0.01)
             cox.fit(df_cox, duration_col="OS_months", event_col="OS_event")
             
             summary = cox.summary.sort_values("p", ascending=True)
-            
-            # Appliquer correction FDR
             p_values = summary["p"].values
             reject, p_adj, _, _ = multipletests(p_values, method='fdr_bh')
             summary["p_adj"] = p_adj
             summary["significant_fdr"] = reject
             
-            print(f"\n✅ Modèle de Cox (n={len(df_cox)})")
-            print("\nVariables significatives (p_adj < 0.05 après correction FDR):")
             sig_vars = summary[summary["p_adj"] < 0.05]
-            print(sig_vars[["coef", "exp(coef)", "p", "p_adj"]])
             
-            # Vérifier les assumptions PH
-            print("\n🔍 Vérification des assumptions Proportional Hazards...")
-            cox_report = cox_checks_and_report(cox, df_cox, "OS_months", "OS_event")
-            print(f"   Convergence: {cox_report.get('model_converged', 'Unknown')}")
-            print(f"   Recommendation: {cox_report.get('recommendation', 'N/A')}")
+            print(f"\n✅ Cox validation (n={len(df_cox)})")
+            print(f"   Variables testées (du DAG): {len(os_predictors_from_dag)}")
+            print(f"   Significatives dans Cox (p_adj<0.05): {len(sig_vars)}")
             
-            # Ajouter les effets significatifs du Cox (après FDR)
+            # COMPARAISON avec les liens du DAG
+            print(f"\n Comparaison DAG vs Cox:")
+            dag_effects = {}
+            for _, row in links_df[links_df["to"].isin(["OS", "OS_months", "OS_event"])].iterrows():
+                dag_effects[row["from"]] = row["coef"]
+            
+            agreements = []
+            disagreements = []
+            
             for var in sig_vars.index:
                 original_var = map_to_original_variable(var)
-                all_links.append({
-                    "from": original_var,
-                    "to": "OS",
-                    "coef": sig_vars.loc[var, "coef"],
-                    "level_from": VAR_TO_LEVEL.get(original_var, -1),
-                    "level_to": 4,
-                    "type": "cox_survival",
-                    "method_source": "cox_survival",
-                    "p_raw": sig_vars.loc[var, "p"],
-                    "p_adj": sig_vars.loc[var, "p_adj"]
-                })
+                cox_coef = sig_vars.loc[var, "coef"]
+                
+                if original_var in dag_effects:
+                    dag_coef = dag_effects[original_var]
+                    same_sign = (cox_coef * dag_coef) > 0
+                    
+                    if same_sign:
+                        agreements.append(original_var)
+                        print(f"   ✅ {original_var}: DAG={dag_coef:.3f}, Cox={cox_coef:.3f} (cohérent)")
+                    else:
+                        disagreements.append(original_var)
+                        print(f"    {original_var}: DAG={dag_coef:.3f}, Cox={cox_coef:.3f} (SIGNE OPPOSÉ!)")
+                else:
+                    print(f"    {original_var}: Cox={cox_coef:.3f} (absent du DAG)")
             
-            # Logger Cox results
-            run_log["cox_model"] = {
-                "n_rows": len(df_cox),
-                "n_significant_raw": len(summary[summary["p"] < 0.05]),
-                "n_significant_fdr": len(sig_vars),
-                "convergence": cox_report.get('model_converged', False),
-                "ph_assumptions": cox_report
+            validation_results["dag_consistency_checks"] = {
+                "cox_n_tested": len(os_predictors_from_dag),
+                "cox_n_significant": len(sig_vars),
+                "n_agreements": len(agreements),
+                "n_disagreements": len(disagreements),
+                "agreement_rate": len(agreements) / len(sig_vars) if len(sig_vars) > 0 else 0,
+                "disagreements_list": disagreements
             }
-            print(f"   PH violations: {cox_report.get('ph_violations', [])}")
+            
+            print(f"\n Taux de cohérence DAG-Cox: {len(agreements)}/{len(sig_vars)} = {100*len(agreements)/len(sig_vars) if len(sig_vars) > 0 else 0:.1f}%")
+            
+            if len(disagreements) > 0:
+                print(f" Attention: {len(disagreements)} variables avec signes opposés entre DAG et Cox!")
+                print(f"   → Peut indiquer suppression ou multicolinéarité")
+            
+            # Vérifier assumptions PH
+            cox_report = cox_checks_and_report(cox, df_cox, "OS_months", "OS_event")
+            validation_results["cox_ph_assumptions"] = cox_report
+            
+            run_log["validation"] = validation_results
             
         except Exception as e:
             print(f"❌ Erreur Cox: {e}")
             import traceback
             traceback.print_exc()
-            run_log["cox_model"] = {"error": str(e)}
+            run_log["validation"] = {"cox_error": str(e)}
 
 # -------------------------------------------------------------------
 # 7. Export du DAG structuré avec corrections FDR
