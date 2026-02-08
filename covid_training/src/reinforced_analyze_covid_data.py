@@ -20,6 +20,7 @@ from statsmodels.discrete.discrete_model import Logit
 from statsmodels.regression.linear_model import OLS
 
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -104,19 +105,20 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', StandardScaler(), [c for c in numeric_features if c in candidates]),
-            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False, drop='first'),
+            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=True, drop='first'),
              [c for c in categorical_features if c in candidates])
         ],
         verbose_feature_names_out=True
     )
 
     model = LogisticRegressionCV(
-        cv=3,
+        cv=2,                         # demandé
         penalty='elasticnet',
         solver='saga',
         l1_ratios=[0.1, 0.5, 0.9],
         scoring='roc_auc',
-        max_iter=2000,
+        max_iter=1000,
+        n_jobs=-1,                    # parallélise la CV
         random_state=random_state
     )
 
@@ -217,4 +219,3 @@ if __name__ == "__main__":
     print("✅ Test OK")
     print(f"n_iterations: {result['n_iterations']}")
     print(f"selected_features: {result['selected_features']}")
-# ...existing code...
