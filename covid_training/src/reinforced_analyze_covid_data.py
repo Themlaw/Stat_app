@@ -643,25 +643,43 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
     X = data[candidates]
     y = data[target]
 
+    # Détection du type de cible pour choisir un modèle de sélection adapté.
+    is_binary_target = y.nunique() == 2
+
+    cat_candidates = [c for c in categorical_features if c in candidates]
+    num_candidates = [c for c in numeric_features if c in candidates]
+
+    # ElasticNetCV nécessite une matrice dense, alors que LogitCV gère bien le sparse.
+    cat_sparse = True if is_binary_target else False
+
     preprocessor = ColumnTransformer(
         transformers=[
-            ('num', StandardScaler(), [c for c in numeric_features if c in candidates]),
-            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=True, drop='first'),
-             [c for c in categorical_features if c in candidates])
+            ('num', StandardScaler(), num_candidates),
+            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=cat_sparse, drop='first'),
+             cat_candidates)
         ],
         verbose_feature_names_out=True
     )
 
-    model = LogisticRegressionCV(
-        cv=2,                         # demandé
-        penalty='elasticnet',
-        solver='saga',
-        l1_ratios=[0.1, 0.5, 0.9],
-        scoring='roc_auc',
-        max_iter=1000,
-        n_jobs=-1,                    # parallélise la CV
-        random_state=random_state
-    )
+    if is_binary_target:
+        model = LogisticRegressionCV(
+            cv=2,
+            penalty='elasticnet',
+            solver='saga',
+            l1_ratios=[0.1, 0.5, 0.9],
+            scoring='roc_auc',
+            max_iter=1000,
+            n_jobs=-1,
+            random_state=random_state
+        )
+    else:
+        model = ElasticNetCV(
+            l1_ratio=[0.1, 0.5, 0.9],
+            cv=3,
+            max_iter=5000,
+            n_jobs=-1,
+            random_state=random_state
+        )
 
     pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor),
@@ -686,7 +704,8 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
     selection_counts = {feature: 0 for feature in candidates}
     n_successful_runs = 0
 
-    print(f"   Running Stability Selection for target: {target} with {n_bootstrap} bootstraps...")
+    model_name = "LogitCV(elasticnet)" if is_binary_target else "ElasticNetCV"
+    print(f"   Running Stability Selection for target: {target} with {n_bootstrap} bootstraps [{model_name}]...")
     for seed in tqdm(seeds, desc=f"Bootstrap {target}", total=len(seeds)):
         X_resampled, y_resampled = resample(
             X, y, replace=True, n_samples=len(X), random_state=seed
@@ -701,7 +720,8 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
             continue
 
         feature_names = pipeline.named_steps['preprocessor'].get_feature_names_out()
-        coefs = pipeline.named_steps['model'].coef_.ravel()
+        model_fitted = pipeline.named_steps['model']
+        coefs = np.asarray(model_fitted.coef_).ravel()
 
         selected_encoded = feature_names[np.abs(coefs) > 1e-6]
         selected_original = set()
@@ -1192,7 +1212,7 @@ def main():
     print("PHASE 4 - EXPORT")
     print("=" * 80)
 
-    export_path = SCRIPT_DIR / "../data/causal_dag_structured.csv"
+    export_path = SCRIPT_DIR / "../data/reinforced_causal_dag_structured.csv"
     links_df = pd.DataFrame(all_links)
     links_df.to_csv(export_path, index=False, encoding='utf-8-sig')
 
