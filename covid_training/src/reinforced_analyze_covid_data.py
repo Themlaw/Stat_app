@@ -749,7 +749,14 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
         'n_iterations': n_successful_runs
     }
 
-def fit_cross_validated_inference(df, target, candidates, n_splits=2):
+def fit_cross_validated_inference(
+    df,
+    target,
+    candidates,
+    n_splits=2,
+    n_bootstrap=DEFAULT_N_BOOTSTRAP,
+    stability_threshold=STABILITY_THRESHOLD
+):
     """
     Orchestration du cross-fitting.
     À chaque itération: sélection de variables sur un fold, inférence non pénalisée
@@ -760,6 +767,8 @@ def fit_cross_validated_inference(df, target, candidates, n_splits=2):
         target (str): Variable cible.
         candidates (list): Variables candidates pour la sélection.
         n_splits (int): Nombre de plis (2 recommandé ici).
+        n_bootstrap (int): Nombre de bootstraps pour la stability selection.
+        stability_threshold (float): Seuil de stabilité pour retenir une variable.
 
     Returns:
         dict: {
@@ -830,8 +839,8 @@ def fit_cross_validated_inference(df, target, candidates, n_splits=2):
             df=df_select,
             candidates=available_candidates,
             target=target,
-            n_bootstrap=DEFAULT_N_BOOTSTRAP,
-            threshold=STABILITY_THRESHOLD,
+            n_bootstrap=n_bootstrap,
+            threshold=stability_threshold,
             random_state=RANDOM_SEED + i
         )
 
@@ -1038,13 +1047,21 @@ def run_cox_validation(df, all_links, base_levels_to_adjust=[0, 1]):
         'cox_significant': significant
     }
 
-def main():
+def main(fast_mode=False):
     print("=" * 80)
     print("PHASE 0 - INITIALISATION")
     print("=" * 80)
 
     if not DATA_PATH.exists():
         raise FileNotFoundError(f"Fichier introuvable: {DATA_PATH}")
+
+    # Paramètres d'exécution: mode rapide optionnel pour itération/debug.
+    n_bootstrap_dml = 30 if fast_mode else DEFAULT_N_BOOTSTRAP
+    n_bootstrap_mediation = 300 if fast_mode else 1000
+    n_splits_dml = 2
+
+    if fast_mode:
+        print("Mode FAST activé: bootstraps réduits pour accélérer l'exécution")
 
     df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
 
@@ -1090,7 +1107,9 @@ def main():
                     df=df,
                     target=target,
                     candidates=predictors,
-                    n_splits=2
+                    n_splits=n_splits_dml,
+                    n_bootstrap=n_bootstrap_dml,
+                    stability_threshold=STABILITY_THRESHOLD
                 )
             except Exception as exc:
                 print(f"    Échec inférence {target}: {exc}")
@@ -1194,7 +1213,7 @@ def main():
             cause=vaccine_col,
             mediator=mediator_col,
             outcome=outcome_col,
-            n_boot=1000,
+            n_boot=n_bootstrap_mediation,
             random_seed=RANDOM_SEED
         )
 
