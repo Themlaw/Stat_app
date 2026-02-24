@@ -522,11 +522,9 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
     total_effects = []
     n_failed = 0
 
-    for _ in tqdm(
-        range(n_boot),
-        desc=f"Bootstrap mediation {cause}->{mediator}->{outcome}",
-        total=n_boot
-    ):
+    print(f"Bootstrap mediation {cause}->{mediator}->{outcome}: {n_boot} itérations")
+    step_report = max(1, n_boot // 10)
+    for i in range(n_boot):
         boot_idx = rng.integers(low=0, high=len(data), size=len(data))
         df_boot = data.iloc[boot_idx].copy()
 
@@ -565,6 +563,9 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
         except Exception:
             n_failed += 1
             continue
+
+        if (i + 1) % step_report == 0 or (i + 1) == n_boot:
+            print(f"   médiation bootstrap: {i + 1}/{n_boot}")
 
     if len(indirect_effects) == 0:
         return None
@@ -828,7 +829,9 @@ def fit_cross_validated_inference(
     fold_details = []
 
     # Schéma circulaire: fold i sélectionne, fold i+1 fait l'inférence.
-    for i in tqdm(range(n_splits), desc=f"Cross-fit {target}", total=n_splits):
+    print(f"Cross-fit {target}: {n_splits} folds")
+    for i in range(n_splits):
+        print(f"   fold {i + 1}/{n_splits}: sélection -> inférence")
         select_idx = split_indices[i][1]
         infer_idx = split_indices[(i + 1) % n_splits][1]
 
@@ -958,7 +961,8 @@ def run_cox_validation(df, all_links, base_levels_to_adjust=[0, 1]):
     df_cox = df[['OS_months', 'OS_event']].copy()
     dropped_high_cardinality = []
 
-    for col in tqdm(predictor_set, desc="Préparation variables Cox", total=len(predictor_set)):
+    print(f"Préparation variables Cox: {len(predictor_set)} variables candidates")
+    for col in predictor_set:
         s = df[col]
         s_num = pd.to_numeric(s, errors='coerce')
 
@@ -1081,7 +1085,7 @@ def main(fast_mode=False):
     print("PHASE 1 - DÉCOUVERTE DE STRUCTURE (DML)")
     print("=" * 80)
 
-    for target_level in tqdm(range(1, 5), desc="Niveaux causaux", total=4):
+    for target_level in range(1, 5):
         targets = [t for t in CAUSAL_LEVELS[target_level] if t in df.columns]
         predictors = [
             v
@@ -1096,7 +1100,8 @@ def main(fast_mode=False):
 
         print(f"\nNiveau {target_level}: {len(targets)} cible(s), {len(predictors)} prédicteur(s) candidats")
 
-        for target in tqdm(targets, desc=f"Cibles niveau {target_level}", total=len(targets), leave=False):
+        for idx_target, target in enumerate(targets, start=1):
+            print(f"  -> Cible {idx_target}/{len(targets)}: {target}")
             if target == "OS_months":
                 print("  - OS_months ignoré (censure)")
                 continue
