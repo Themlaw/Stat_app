@@ -23,6 +23,8 @@ from statsmodels.regression.linear_model import OLS
 
 from tqdm import tqdm
 from joblib import Parallel, delayed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing as mp
 
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -517,55 +519,71 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
 
     rng = np.random.default_rng(random_seed)
 
+    def _single_mediation_boot(boot_seed, data_input, cause_col, mediator_col, outcome_col, is_med_binary, is_out_binary):
+        """Exécute une seule itération bootstrap de médiation."""
+        rng_boot = np.random.default_rng(boot_seed)
+        boot_idx = rng_boot.integers(low=0, high=len(data_input), size=len(data_input))
+        df_boot = data_input.iloc[boot_idx].copy()
+
+        try:
+            # Modèle a: mediator ~ cause
+            X_a = add_constant(df_boot[[cause_col]], has_constant='add')
+            y_a = df_boot[mediator_col]
+            if is_med_binary:
+                model_a = Logit(y_a, X_a).fit(disp=False, maxiter=200)
+            else:
+                model_a = OLS(y_a, X_a).fit()
+            a_coef = float(model_a.params[cause_col])
+
+            # Modèle b/c': outcome ~ cause + mediator
+            X_b = add_constant(df_boot[[cause_col, mediator_col]], has_constant='add')
+            y_b = df_boot[outcome_col]
+            if is_out_binary:
+                model_b = Logit(y_b, X_b).fit(disp=False, maxiter=200)
+            else:
+                model_b = OLS(y_b, X_b).fit()
+
+            b_coef = float(model_b.params[mediator_col])
+            c_prime = float(model_b.params[cause_col])
+
+            # Modèle total c: outcome ~ cause
+            X_c = add_constant(df_boot[[cause_col]], has_constant='add')
+            if is_out_binary:
+                model_c = Logit(y_b, X_c).fit(disp=False, maxiter=200)
+            else:
+                model_c = OLS(y_b, X_c).fit()
+            c_total = float(model_c.params[cause_col])
+
+            return {
+                'indirect': a_coef * b_coef,
+                'direct': c_prime,
+                'total': c_total,
+                'success': True
+            }
+        except Exception:
+            return {'success': False}
+
+    print(f"Bootstrap mediation {cause}->{mediator}->{outcome}: {n_boot} itérations (parallélisées)")
+    seeds = np.random.randint(0, 100000, size=n_boot)
+
+    # Parallélisation avec joblib (meilleur pour les stats)
+    results = Parallel(n_jobs=-1, backend='threading')(
+        delayed(_single_mediation_boot)(seed, data, cause, mediator, outcome, is_mediator_binary, is_outcome_binary)
+        for seed in seeds
+    )
+
     indirect_effects = []
     direct_effects = []
     total_effects = []
     n_failed = 0
 
-    print(f"Bootstrap mediation {cause}->{mediator}->{outcome}: {n_boot} itérations")
-    step_report = max(1, n_boot // 10)
-    for i in range(n_boot):
-        boot_idx = rng.integers(low=0, high=len(data), size=len(data))
-        df_boot = data.iloc[boot_idx].copy()
-
-        try:
-            # Modèle a: mediator ~ cause
-            X_a = add_constant(df_boot[[cause]], has_constant='add')
-            y_a = df_boot[mediator]
-            if is_mediator_binary:
-                model_a = Logit(y_a, X_a).fit(disp=False, maxiter=200)
-            else:
-                model_a = OLS(y_a, X_a).fit()
-            a_coef = float(model_a.params[cause])
-
-            # Modèle b/c': outcome ~ cause + mediator
-            X_b = add_constant(df_boot[[cause, mediator]], has_constant='add')
-            y_b = df_boot[outcome]
-            if is_outcome_binary:
-                model_b = Logit(y_b, X_b).fit(disp=False, maxiter=200)
-            else:
-                model_b = OLS(y_b, X_b).fit()
-
-            b_coef = float(model_b.params[mediator])
-            c_prime = float(model_b.params[cause])
-
-            # Modèle total c: outcome ~ cause
-            X_c = add_constant(df_boot[[cause]], has_constant='add')
-            if is_outcome_binary:
-                model_c = Logit(y_b, X_c).fit(disp=False, maxiter=200)
-            else:
-                model_c = OLS(y_b, X_c).fit()
-            c_total = float(model_c.params[cause])
-
-            indirect_effects.append(a_coef * b_coef)
-            direct_effects.append(c_prime)
-            total_effects.append(c_total)
-        except Exception:
+    for res in results:
+        if res.get('success', False):
+            indirect_effects.append(res['indirect'])
+            direct_effects.append(res['direct'])
+            total_effects.append(res['total'])
+        else:
             n_failed += 1
-            continue
-
-        if (i + 1) % step_report == 0 or (i + 1) == n_boot:
-            print(f"   médiation bootstrap: {i + 1}/{n_boot}")
 
     if len(indirect_effects) == 0:
         return None
@@ -702,40 +720,50 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
     np.random.seed(random_state)
     seeds = np.random.randint(0, 100000, size=n_bootstrap)
 
-    selection_counts = {feature: 0 for feature in candidates}
-    n_successful_runs = 0
+    def _single_stability_iteration(seed, X_input, y_input, pipeline_obj, candidates_list):
+        """Exécute une itération de stabilité selection."""
+        try:
+            X_resampled, y_resampled = resample(
+                X_input, y_input, replace=True, n_samples=len(X_input), random_state=seed
+            )
+
+            if y_resampled.nunique() < 2:
+                return set()
+
+            pipeline_obj.fit(X_resampled, y_resampled)
+            feature_names = pipeline_obj.named_steps['preprocessor'].get_feature_names_out()
+            model_fitted = pipeline_obj.named_steps['model']
+            coefs = np.asarray(model_fitted.coef_).ravel()
+
+            selected_encoded = feature_names[np.abs(coefs) > 1e-6]
+            selected_original = set()
+
+            for enc in selected_encoded:
+                orig = _map_encoded_to_original(enc, candidates_list)
+                if orig is not None:
+                    selected_original.add(orig)
+
+            return selected_original
+        except Exception:
+            return set()
 
     model_name = "LogitCV(elasticnet)" if is_binary_target else "ElasticNetCV"
     print(f"   Running Stability Selection for target: {target} with {n_bootstrap} bootstraps [{model_name}]...")
-    for seed in tqdm(seeds, desc=f"Bootstrap {target}", total=len(seeds)):
-        X_resampled, y_resampled = resample(
-            X, y, replace=True, n_samples=len(X), random_state=seed
-        )
 
-        if y_resampled.nunique() < 2:
-            continue
+    # Parallélisation avec joblib
+    results = Parallel(n_jobs=-1, backend='threading')(
+        delayed(_single_stability_iteration)(seed, X, y, clone(pipeline), candidates)
+        for seed in seeds
+    )
 
-        try:
-            pipeline.fit(X_resampled, y_resampled)
-        except Exception:
-            continue
+    selection_counts = {feature: 0 for feature in candidates}
+    n_successful_runs = 0
 
-        feature_names = pipeline.named_steps['preprocessor'].get_feature_names_out()
-        model_fitted = pipeline.named_steps['model']
-        coefs = np.asarray(model_fitted.coef_).ravel()
-
-        selected_encoded = feature_names[np.abs(coefs) > 1e-6]
-        selected_original = set()
-
-        for enc in selected_encoded:
-            orig = _map_encoded_to_original(enc, candidates)
-            if orig is not None:
-                selected_original.add(orig)
-
-        for feature in selected_original:
-            selection_counts[feature] += 1
-
-        n_successful_runs += 1
+    for selected_original in results:
+        if selected_original:  # Si le set n'est pas vide
+            for feature in selected_original:
+                selection_counts[feature] += 1
+            n_successful_runs += 1
     if n_successful_runs == 0:
         print(f"   Aucune itération réussie pour {target}.")
         return {'selected_features': [], 'stability_scores': {}, 'n_iterations': 0}
@@ -828,49 +856,60 @@ def fit_cross_validated_inference(
     fold_results_for_aggregation = []
     fold_details = []
 
-    # Schéma circulaire: fold i sélectionne, fold i+1 fait l'inférence.
-    print(f"Cross-fit {target}: {n_splits} folds")
-    for i in range(n_splits):
-        print(f"   fold {i + 1}/{n_splits}: sélection -> inférence")
-        select_idx = split_indices[i][1]
-        infer_idx = split_indices[(i + 1) % n_splits][1]
+    def _process_fold(fold_idx, avail_cand, df_data, is_bin, split_inds, target_col, n_boot, stab_thresh):
+        """Traite un seul fold de cross-validation."""
+        select_idx = split_inds[fold_idx][1]
+        infer_idx = split_inds[(fold_idx + 1) % len(split_inds)][1]
 
-        df_select = data.iloc[select_idx].copy()
-        df_infer = data.iloc[infer_idx].copy()
+        df_select = df_data.iloc[select_idx].copy()
+        df_infer = df_data.iloc[infer_idx].copy()
 
         selection = run_stability_selection(
             df=df_select,
-            candidates=available_candidates,
-            target=target,
-            n_bootstrap=n_bootstrap,
-            threshold=stability_threshold,
-            random_state=RANDOM_SEED + i
+            candidates=avail_cand,
+            target=target_col,
+            n_bootstrap=n_boot,
+            threshold=stab_thresh,
+            random_state=RANDOM_SEED + fold_idx
         )
 
         selected_features = selection.get('selected_features', [])
         fit_result = fit_unpenalized_model(
             df_train=df_infer,
             features=selected_features,
-            is_binary=is_binary,
-            target=target
+            is_binary=is_bin,
+            target=target_col
         )
 
-        fit_result['selector_fold'] = i
-        fit_result['inference_fold'] = (i + 1) % n_splits
+        fit_result['selector_fold'] = fold_idx
+        fit_result['inference_fold'] = (fold_idx + 1) % len(split_inds)
         fit_result['selected_features'] = selected_features
         fit_result['stability_scores'] = selection.get('stability_scores', {})
         fit_result['n_bootstrap_success'] = selection.get('n_iterations', 0)
 
-        fold_results_for_aggregation.append(fit_result)
-        fold_details.append({
-            'selector_fold': i,
-            'inference_fold': (i + 1) % n_splits,
+        fold_detail = {
+            'selector_fold': fold_idx,
+            'inference_fold': (fold_idx + 1) % len(split_inds),
             'n_select_obs': int(len(df_select)),
             'n_infer_obs': int(len(df_infer)),
             'n_selected_features': int(len(selected_features)),
             'selected_features': selected_features,
             'n_bootstrap_success': int(selection.get('n_iterations', 0))
-        })
+        }
+
+        return fit_result, fold_detail
+
+    print(f"Cross-fit {target}: {n_splits} folds (parallélisés)")
+
+    # Parallélisation avec joblib
+    results = Parallel(n_jobs=-1, backend='threading')(
+        delayed(_process_fold)(i, available_candidates, data, is_binary, split_indices, target, n_bootstrap, stability_threshold)
+        for i in range(n_splits)
+    )
+
+    for fit_result, fold_detail in results:
+        fold_results_for_aggregation.append(fit_result)
+        fold_details.append(fold_detail)
 
     aggregated = aggregate_results(fold_results_for_aggregation)
 
@@ -1085,8 +1124,9 @@ def main(fast_mode=False):
     print("PHASE 1 - DÉCOUVERTE DE STRUCTURE (DML)")
     print("=" * 80)
 
+    all_targets_to_process = []
     for target_level in range(1, 5):
-        targets = [t for t in CAUSAL_LEVELS[target_level] if t in df.columns]
+        targets = [t for t in CAUSAL_LEVELS[target_level] if t in df.columns and t != "OS_months"]
         predictors = [
             v
             for lvl in range(0, target_level)
@@ -1098,64 +1138,74 @@ def main(fast_mode=False):
         if not targets or not predictors:
             continue
 
-        print(f"\nNiveau {target_level}: {len(targets)} cible(s), {len(predictors)} prédicteur(s) candidats")
+        print(f"Niveau {target_level}: {len(targets)} cible(s), {len(predictors)} prédicteur(s) candidats")
+        for target in targets:
+            all_targets_to_process.append((target, predictors, target_level))
 
-        for idx_target, target in enumerate(targets, start=1):
-            print(f"  -> Cible {idx_target}/{len(targets)}: {target}")
-            if target == "OS_months":
-                print("  - OS_months ignoré (censure)")
+    def _process_target_inference(target_info):
+        """Traite un seul target pour l'inférence DML."""
+        target, predictors, level = target_info
+        try:
+            print(f"  -> Traitement {target} (niveau {level})")
+            inference_output = fit_cross_validated_inference(
+                df=df,
+                target=target,
+                candidates=predictors,
+                n_splits=n_splits_dml,
+                n_bootstrap=n_bootstrap_dml,
+                stability_threshold=STABILITY_THRESHOLD
+            )
+            return (target, predictors, inference_output)
+        except Exception as exc:
+            print(f"    Échec inférence {target}: {exc}")
+            return (target, predictors, None)
+
+    # Parallélisation au niveau des targets
+    print(f"\nParallélisation de {len(all_targets_to_process)} inférences DML...")
+    inference_results = Parallel(n_jobs=-1, backend='threading')(
+        delayed(_process_target_inference)(target_info)
+        for target_info in all_targets_to_process
+    )
+
+    for target, predictors, inference_output in inference_results:
+        if inference_output is None:
+            continue
+
+        agg_df = inference_output.get('aggregated_results', pd.DataFrame())
+        if agg_df is None or agg_df.empty:
+            continue
+
+        # Approximation de stabilité: fréquence de sélection par feature sur les folds.
+        fold_details = inference_output.get('fold_details', [])
+        selected_lists = [fd.get('selected_features', []) for fd in fold_details if isinstance(fd, dict)]
+        n_fold = max(len(selected_lists), 1)
+        stability_map = {}
+        for selected in selected_lists:
+            for feat in selected:
+                stability_map[feat] = stability_map.get(feat, 0) + 1
+        stability_map = {k: v / n_fold for k, v in stability_map.items()}
+
+        sig_df = agg_df[agg_df['p_value_fdr_bh'] < 0.05].copy() if 'p_value_fdr_bh' in agg_df.columns else pd.DataFrame()
+
+        print(f"    {target}: {len(sig_df)} variables significatives FDR<0.05")
+        for _, row in sig_df.iterrows():
+            src = row.get('feature')
+            if pd.isna(src):
                 continue
 
-            print(f"  - Inference croisée pour: {target}")
-            try:
-                inference_output = fit_cross_validated_inference(
-                    df=df,
-                    target=target,
-                    candidates=predictors,
-                    n_splits=n_splits_dml,
-                    n_bootstrap=n_bootstrap_dml,
-                    stability_threshold=STABILITY_THRESHOLD
-                )
-            except Exception as exc:
-                print(f"    Échec inférence {target}: {exc}")
-                continue
+            src = str(src)
+            src_original = map_feature_to_original(src, predictors)
 
-            agg_df = inference_output.get('aggregated_results', pd.DataFrame())
-            if agg_df is None or agg_df.empty:
-                print("    Aucun résultat agrégé")
-                continue
-
-            # Approximation de stabilité: fréquence de sélection par feature sur les folds.
-            fold_details = inference_output.get('fold_details', [])
-            selected_lists = [fd.get('selected_features', []) for fd in fold_details if isinstance(fd, dict)]
-            n_fold = max(len(selected_lists), 1)
-            stability_map = {}
-            for selected in selected_lists:
-                for feat in selected:
-                    stability_map[feat] = stability_map.get(feat, 0) + 1
-            stability_map = {k: v / n_fold for k, v in stability_map.items()}
-
-            sig_df = agg_df[agg_df['p_value_fdr_bh'] < 0.05].copy() if 'p_value_fdr_bh' in agg_df.columns else pd.DataFrame()
-
-            print(f"    Variables significatives FDR<0.05: {len(sig_df)}")
-            for _, row in sig_df.iterrows():
-                src = row.get('feature')
-                if pd.isna(src):
-                    continue
-
-                src = str(src)
-                src_original = map_feature_to_original(src, predictors)
-
-                all_links.append({
-                    'from': src_original,
-                    'from_encoded': src,
-                    'to': target,
-                    'coef': float(row.get('coef_mean', np.nan)),
-                    'p_value': float(row.get('p_value_fdr_bh', np.nan)),
-                    'e_value': float(row.get('e_value_point_mean', np.nan)),
-                    'stability': float(stability_map.get(src_original, np.nan)),
-                    'method': 'cross_fitted_dml'
-                })
+            all_links.append({
+                'from': src_original,
+                'from_encoded': src,
+                'to': target,
+                'coef': float(row.get('coef_mean', np.nan)),
+                'p_value': float(row.get('p_value_fdr_bh', np.nan)),
+                'e_value': float(row.get('e_value_point_mean', np.nan)),
+                'stability': float(stability_map.get(src_original, np.nan)),
+                'method': 'cross_fitted_dml'
+            })
 
     print(f"\nLiens causaux détectés avant Cox: {len(all_links)}")
 
