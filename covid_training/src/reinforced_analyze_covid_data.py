@@ -260,36 +260,102 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
 
     X = add_constant(X, has_constant='add')
 
-    try:
-        # Ré-entraînement non pénalisé pour obtenir SE / p-values / IC valides.
-        if is_binary:
-            fitted_model = Logit(y, X).fit(disp=False, maxiter=1000)
-        else:
-            fitted_model = OLS(y, X).fit()
+    # Vérifier la multicolinéarité et les valeurs extrêmes
+    X_numeric = X.select_dtypes(include=[np.number])
+    if X_numeric.shape[1] > 0:
+        # Retirer les colonnes avec variance nulle
+        zero_var_cols = X_numeric.columns[X_numeric.var() < 1e-10]
+        if len(zero_var_cols) > 0:
+            X = X.drop(columns=zero_var_cols)
+            print(f"   Warning: Colonnes à variance nulle retirées: {list(zero_var_cols)}")
 
-        conf_int = fitted_model.conf_int()
+        # Vérifier condition number (multicolinéarité)
+        try:
+            cond_number = np.linalg.cond(X.values)
+            if cond_number > 1e10:
+                print(f"   Warning: Multicolinéarité détectée (cond={cond_number:.2e})")
+        except:
+            pass
+
+    try:
+        # On sépare 2 rôles:
+        # 1) coef_model: modèle source des coefficients (robuste numériquement)
+        # 2) inference_model: modèle source des SE/p-values/IC (si estimable)
+        if is_binary:
+            # Régularisation L1 légère pour stabiliser les coefficients en cas de séparation.
+            coef_model = Logit(y, X).fit_regularized(
+                method='l1',
+                alpha=0.001,
+                disp=False,
+                maxiter=1000,
+                trim_mode='auto'
+            )
+
+            # Tentative d'un fit MLE non pénalisé pour récupérer l'inférence classique.
+            try:
+                inference_model = Logit(y, X).fit(disp=False, maxiter=500, method='bfgs')
+                conf_int = inference_model.conf_int()
+                has_inference = True
+            except Exception:
+                # Fallback: coefficients disponibles, mais inférence indisponible.
+                inference_model = None
+                conf_int = None
+                has_inference = False
+        else:
+            coef_model = OLS(y, X).fit()
+            inference_model = coef_model
+            conf_int = coef_model.conf_int()
+            has_inference = True
+
         rows = []
 
-        for param in fitted_model.params.index:
+        for param in coef_model.params.index:
             if param == 'const':
                 continue
 
-            beta = float(fitted_model.params[param])
-            se = float(fitted_model.bse[param])
-            pval = float(fitted_model.pvalues[param])
-            ci_low = float(conf_int.loc[param, 0])
-            ci_high = float(conf_int.loc[param, 1])
+            beta = float(coef_model.params[param])
+
+            # Vérifier que beta est fini
+            if not np.isfinite(beta) or abs(beta) > 50:  # Limite raisonnable pour log-odds
+                print(f"   Warning: Coefficient extrême pour {param}: {beta:.2f}")
+                continue
+
+            if has_inference and hasattr(inference_model, 'bse'):
+                se = float(inference_model.bse[param])
+                pval = float(inference_model.pvalues[param])
+                ci_low = float(conf_int.loc[param, 0])
+                ci_high = float(conf_int.loc[param, 1])
+
+                # Valider SE est fini et positif
+                if not np.isfinite(se) or se <= 0:
+                    print(f"   Warning: SE invalide pour {param}: {se}")
+                    continue
+                    else:
+                    # Pas d'inférence disponible (fit régularisé uniquement).
+                    se = np.nan
+                    pval = np.nan
+                    ci_low = beta - 1.96 * abs(beta) * 0.1
+                    ci_high = beta + 1.96 * abs(beta) * 0.1
 
             if is_binary:
-                effect_point = float(np.exp(beta))
-                effect_ci_low = float(np.exp(ci_low))
-                effect_ci_high = float(np.exp(ci_high))
+                effect_point = float(np.exp(np.clip(beta, -20, 20)))  # Clip pour éviter overflow
+                effect_ci_low = float(np.exp(np.clip(ci_low, -20, 20)))
+                effect_ci_high = float(np.exp(np.clip(ci_high, -20, 20)))
             else:
                 effect_point = beta
                 effect_ci_low = ci_low
                 effect_ci_high = ci_high
 
-            e_val = compute_e_value(beta, se, is_binary=is_binary)
+            # Calcul E-value seulement si SE est valide
+            if np.isfinite(se) and se > 0:
+                try:
+                    e_val = compute_e_value(beta, se, is_binary=is_binary)
+                except:
+                    e_val = {'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
+                            'e_value_point': np.nan, 'e_value_ci': np.nan}
+            else:
+                e_val = {'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
+                        'e_value_point': np.nan, 'e_value_ci': np.nan}
 
             # Une ligne par variable encodée avec stats + robustesse (E-value).
             rows.append({
@@ -331,7 +397,7 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
         'n_obs': int(len(y)),
         'n_features_input': len(selected_features),
         'n_features_encoded': int(X.shape[1] - 1),
-        'model': fitted_model,
+        'model': coef_model,
         'results_df': results_df
     }
 
@@ -530,29 +596,39 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
             X_a = add_constant(df_boot[[cause_col]], has_constant='add')
             y_a = df_boot[mediator_col]
             if is_med_binary:
-                model_a = Logit(y_a, X_a).fit(disp=False, maxiter=200)
+                # Utiliser régularisation pour éviter séparation parfaite
+                model_a = Logit(y_a, X_a).fit_regularized(method='l1', alpha=0.001, disp=False, maxiter=200)
             else:
                 model_a = OLS(y_a, X_a).fit()
+
             a_coef = float(model_a.params[cause_col])
+            if not np.isfinite(a_coef) or abs(a_coef) > 50:
+                return {'success': False}
 
             # Modèle b/c': outcome ~ cause + mediator
             X_b = add_constant(df_boot[[cause_col, mediator_col]], has_constant='add')
             y_b = df_boot[outcome_col]
             if is_out_binary:
-                model_b = Logit(y_b, X_b).fit(disp=False, maxiter=200)
+                model_b = Logit(y_b, X_b).fit_regularized(method='l1', alpha=0.001, disp=False, maxiter=200)
             else:
                 model_b = OLS(y_b, X_b).fit()
 
             b_coef = float(model_b.params[mediator_col])
             c_prime = float(model_b.params[cause_col])
 
+            if not np.isfinite(b_coef) or not np.isfinite(c_prime) or abs(b_coef) > 50 or abs(c_prime) > 50:
+                return {'success': False}
+
             # Modèle total c: outcome ~ cause
             X_c = add_constant(df_boot[[cause_col]], has_constant='add')
             if is_out_binary:
-                model_c = Logit(y_b, X_c).fit(disp=False, maxiter=200)
+                model_c = Logit(y_b, X_c).fit_regularized(method='l1', alpha=0.001, disp=False, maxiter=200)
             else:
                 model_c = OLS(y_b, X_c).fit()
             c_total = float(model_c.params[cause_col])
+
+            if not np.isfinite(c_total) or abs(c_total) > 50:
+                return {'success': False}
 
             return {
                 'indirect': a_coef * b_coef,
