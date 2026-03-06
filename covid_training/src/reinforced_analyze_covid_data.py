@@ -243,7 +243,9 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
         if set(unique_vals) != {0, 1}:
             y = y.map({unique_vals[0]: 0, unique_vals[1]: 1})
 
-    # Encodage des catégorielles (one-hot) + intercept explicite.
+    # Encodage des catégorielles (one-hot)
+    # IMPORTANT: drop_first=True évite la dummy trap AVEC add_constant
+    # (si on fait drop_first=True, la première catégorie devient la référence implicite)
     X_raw = data[selected_features]
     X = pd.get_dummies(X_raw, drop_first=True, dtype=float)
 
@@ -258,87 +260,112 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
             'results_df': pd.DataFrame()
         }
 
+    # CORRECTION CRITIQUE: Ajouter la constante AVANT de vérifier la multicolinéarité
+    # (add_constant avec has_constant='add' ajoute seulement si absent)
     X = add_constant(X, has_constant='add')
 
     # Vérifier la multicolinéarité et les valeurs extrêmes
     X_numeric = X.select_dtypes(include=[np.number])
     if X_numeric.shape[1] > 0:
-        # Retirer les colonnes avec variance nulle
+        # Retirer les colonnes avec variance nulle (vrai problème de multicolinéarité)
         zero_var_cols = X_numeric.columns[X_numeric.var() < 1e-10]
         if len(zero_var_cols) > 0:
             X = X.drop(columns=zero_var_cols)
-            print(f"   Warning: Colonnes à variance nulle retirées: {list(zero_var_cols)}")
+            print(f"   Info: Colonnes à variance nulle retirées (multicolinéarité): {list(zero_var_cols)}")
 
-        # Vérifier condition number (multicolinéarité)
+        # Vérifier condition number (indicateur mais pas critique)
         try:
             cond_number = np.linalg.cond(X.values)
-            if cond_number > 1e10:
-                print(f"   Warning: Multicolinéarité détectée (cond={cond_number:.2e})")
+            # Note: Avec dummies, cond_number peut être élevé MAIS c'est normal
+            # On log seulement si > 1e15 (singularité vraie)
+            if cond_number > 1e15:
+                print(f"   Warning: Matrice quasi-singulière détectée (cond={cond_number:.2e})")
         except:
             pass
 
     try:
-        # On sépare 2 rôles:
-        # 1) coef_model: modèle source des coefficients (robuste numériquement)
-        # 2) inference_model: modèle source des SE/p-values/IC (si estimable)
+        # STRATÉGIE: Séparer coefficients robustes et inférence statistique
+        # ====================================================================
+        # coef_model : Source des coefficients β (régularisés si besoin)
+        # inference_model : Source de SE/p-values/CI (fit MLE non pénalisé, peut échouer)
+        # has_inference : Flag indiquant si stats inférentielles sont disponibles
+
         if is_binary:
-            # Régularisation L1 légère pour stabiliser les coefficients en cas de séparation.
+            # ÉTAPE 1: Fit régularisé L1 pour obtenir des coefficients stables
+            # (même en cas de séparation parfaite ou quasi-séparation)
             coef_model = Logit(y, X).fit_regularized(
                 method='l1',
-                alpha=0.001,
+                alpha=0.001,  # Très faible pénalité (minimal bias)
                 disp=False,
                 maxiter=1000,
                 trim_mode='auto'
             )
 
-            # Tentative d'un fit MLE non pénalisé pour récupérer l'inférence classique.
+            # ÉTAPE 2: Essayer un fit MLE classique (sans pénalité) pour l'inférence
+            # Cela peut échouer si séparation/quasi-séparation → fallback sans SE/p-val
             try:
-                inference_model = Logit(y, X).fit(disp=False, maxiter=500, method='bfgs')
+                inference_model = Logit(y, X).fit(
+                    disp=False,
+                    maxiter=500,
+                    method='bfgs'
+                )
                 conf_int = inference_model.conf_int()
-                has_inference = True
+                has_inference = True  # Stats inférentielles disponibles ✓
             except Exception:
-                # Fallback: coefficients disponibles, mais inférence indisponible.
+                # Fit MLE a échoué → on garde coef_model mais pas d'inférence
                 inference_model = None
                 conf_int = None
-                has_inference = False
+                has_inference = False  # Inférence indisponible, on skipera SE/p-val
         else:
+            # Cas continu (OLS): un seul fit suffit (rarement d'instabilité numérique)
             coef_model = OLS(y, X).fit()
             inference_model = coef_model
             conf_int = coef_model.conf_int()
-            has_inference = True
+            has_inference = True  # Inférence toujours dispo en OLS
 
         rows = []
 
+        # ITÉRATION: Extraire coefficients et stats pour chaque variable
         for param in coef_model.params.index:
             if param == 'const':
                 continue
 
+            # Source unique et fiable pour les coefficients
             beta = float(coef_model.params[param])
 
-            # Vérifier que beta est fini
-            if not np.isfinite(beta) or abs(beta) > 50:  # Limite raisonnable pour log-odds
+            # VALIDATION: Coefficient "raisonnable"
+            # (beta > 50 en log-odds = OR > 5e21, non interprétable)
+            if not np.isfinite(beta) or abs(beta) > 50:
                 print(f"   Warning: Coefficient extrême pour {param}: {beta:.2f}")
                 continue
 
+            # INFÉRENCE: Récupérer SE/p-values/IC si disponibles, sinon NaN
             if has_inference and hasattr(inference_model, 'bse'):
+                # Cas nominal: on a un fit MLE valide
                 se = float(inference_model.bse[param])
                 pval = float(inference_model.pvalues[param])
                 ci_low = float(conf_int.loc[param, 0])
                 ci_high = float(conf_int.loc[param, 1])
 
-                # Valider SE est fini et positif
+                # VALIDATION: SE doit être fini et positif (sinon on signale mais on garde le coef)
                 if not np.isfinite(se) or se <= 0:
-                    print(f"   Warning: SE invalide pour {param}: {se}")
-                    continue
-                else:
-                    # Pas d'inférence disponible (fit régularisé uniquement).
+                    # Ne pas faire continue! On garde le coefficient même sans SE valide
+                    print(f"   Info: SE invalide pour {param}: {se} (coef={beta:.3f} conservé)")
                     se = np.nan
                     pval = np.nan
-                    ci_low = beta - 1.96 * abs(beta) * 0.1
-                    ci_high = beta + 1.96 * abs(beta) * 0.1
+                    ci_low = np.nan
+                    ci_high = np.nan
+            else:
+                # Cas fallback: fit régularisé uniquement (pas de SE/p-val valides)
+                # On met NaN pour indiquer "stats indisponibles"
+                se = np.nan
+                pval = np.nan
+                ci_low = np.nan
+                ci_high = np.nan
 
+            # TRANSFORMATION: exp(coef) pour résultats interprétables (OR/HR)
             if is_binary:
-                effect_point = float(np.exp(np.clip(beta, -20, 20)))  # Clip pour éviter overflow
+                effect_point = float(np.exp(np.clip(beta, -20, 20)))
                 effect_ci_low = float(np.exp(np.clip(ci_low, -20, 20)))
                 effect_ci_high = float(np.exp(np.clip(ci_high, -20, 20)))
             else:
@@ -346,18 +373,25 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
                 effect_ci_low = ci_low
                 effect_ci_high = ci_high
 
-            # Calcul E-value seulement si SE est valide
+            # E-VALUE: Sensibilité à une variable non-mesurée confondante
+            # (Calcul seulement si SE disponible et valide)
             if np.isfinite(se) and se > 0:
                 try:
                     e_val = compute_e_value(beta, se, is_binary=is_binary)
-                except:
-                    e_val = {'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
-                            'e_value_point': np.nan, 'e_value_ci': np.nan}
+                except Exception:
+                    # Fallback si compute_e_value échoue
+                    e_val = {
+                        'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
+                        'e_value_point': np.nan, 'e_value_ci': np.nan
+                    }
             else:
-                e_val = {'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
-                        'e_value_point': np.nan, 'e_value_ci': np.nan}
+                # SE invalide → E-value indisponible
+                e_val = {
+                    'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
+                    'e_value_point': np.nan, 'e_value_ci': np.nan
+                }
 
-            # Une ligne par variable encodée avec stats + robustesse (E-value).
+            # ENREGISTREMENT: Une ligne = une variable avec toutes ses stats
             rows.append({
                 'feature': param,
                 'coef': beta,
@@ -383,12 +417,12 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
             'n_features_input': len(selected_features),
             'n_features_encoded': int(X.shape[1] - 1),
             'model': None,
-            'results_df': pd.DataFrame() 
+            'results_df': pd.DataFrame()
         }
         
     results_df = pd.DataFrame(rows)
     if not results_df.empty:
-        # Tri pratique pour lecture rapide des signaux les plus forts.
+        # Tri par p-value pour lecture rapide des signaux les plus forts
         results_df = results_df.sort_values('p_value').reset_index(drop=True)
 
     return {
@@ -397,7 +431,7 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
         'n_obs': int(len(y)),
         'n_features_input': len(selected_features),
         'n_features_encoded': int(X.shape[1] - 1),
-        'model': coef_model,
+        'model': coef_model,  # Retourner le modèle des coefficients (régularisé si nécessaire)
         'results_df': results_df
     }
 
