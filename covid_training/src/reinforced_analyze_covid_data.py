@@ -4,11 +4,12 @@ from pathlib import Path
 import warnings
 import json
 from datetime import datetime
+from types import SimpleNamespace
 
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LassoCV, LogisticRegressionCV, ElasticNetCV
+from sklearn.linear_model import LogisticRegressionCV, LogisticRegression, ElasticNetCV
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.base import clone
 from sklearn.utils import resample
@@ -20,6 +21,7 @@ from statsmodels.stats.multitest import multipletests
 from statsmodels.tools import add_constant
 from statsmodels.discrete.discrete_model import Logit
 from statsmodels.regression.linear_model import OLS
+import statsmodels.api as sm
 
 from tqdm import tqdm
 from joblib import Parallel, delayed
@@ -46,6 +48,32 @@ DEFAULT_N_BOOTSTRAP = 100       # Nombre d'itérations pour la stabilité
 STABILITY_THRESHOLD = 0.65      # Seuil de sélection (une variable doit apparaître dans 65% des bootstraps)
 RANDOM_SEED = 42
 
+# Hyperparamètres du solveur
+LOGIT_CV_MAX_ITER = 8000
+LOGIT_CV_TOL = 3e-3
+LOGIT_CV_CS = np.logspace(-1, 1, 5)
+LOGIT_CV_L1_RATIOS = [0.5]
+OHE_MIN_FREQUENCY = 0.02
+OHE_MAX_CATEGORIES = 10
+RARE_CATEGORY_MIN_COUNT = 20
+
+# Paramètre du solveur
+USE_LOGIT_CV_IN_STABILITY = False
+LOGIT_STABILITY_C = 1.0
+LOGIT_STABILITY_L1_RATIO = 0.5
+BINARY_STABILITY_MODEL = "liblinear_l1"  # options: "saga_elasticnet", "liblinear_l1", "lbfgs_l2"
+
+# Paramètre de parallèlisme
+TARGET_PARALLEL_N_JOBS = 1
+FOLD_PARALLEL_N_JOBS = 1
+BOOTSTRAP_PARALLEL_N_JOBS = 1
+
+# Paramètre du statmodel
+STATSMODELS_LOGIT_ALPHA = 0.05
+STATSMODELS_LOGIT_MAXITER = 2000
+ENABLE_BINARY_MLE_INFERENCE = True
+MAX_LOG_EXP_INPUT = 20.0
+
 # Chemins
 SCRIPT_DIR = Path(__file__).parent
 DATA_PATH = SCRIPT_DIR / "../data/combined_covid_data.csv"
@@ -53,11 +81,11 @@ DATA_PATH = SCRIPT_DIR / "../data/combined_covid_data.csv"
 # -------------------------------------------------------------------
 # DÉFINITION DE LA STRUCTURE CAUSALE
 # -------------------------------------------------------------------
-categorical_features = ["Age_at_ICI_start","Ethnicity","Gender","Immunotherapy_Agent"]
+categorical_features = ["Ethnicity", "Gender", "Immunotherapy_Agent"]
 numeric_features = ["BRAF","CNS_disease","Concurrent_Chemo","ECOG",
                     "English_as_primary_language", "Previous_history_of_malignancy_at_ICI_start",
                     "Steroid_win_1_month_of_ICI_start","Steroid_win_1_month_of_Vaccine",
-                    "Vaccine100"
+                    "Vaccine100", "Age_at_ICI_start"
                     ]
 target_variables = ["OS_event", "OS_months"]
 
@@ -99,13 +127,42 @@ def map_feature_to_original(feature_name, candidate_variables):
 
     return feature_name
 
+
+def coerce_numeric_predictors(df_in, candidate_variables):
+    """Force les prédicteurs numériques en float (ex: valeurs '>89' -> NaN)."""
+    out = df_in.copy()
+    numeric_in_data = [c for c in candidate_variables if c in out.columns and c in numeric_features]
+    for col in numeric_in_data:
+        out[col] = pd.to_numeric(out[col], errors='coerce')
+    return out
+
+
+def normalize_categorical_predictors(df_in, candidate_variables, min_count=RARE_CATEGORY_MIN_COUNT):
+    """Nettoie les modalités et regroupe les niveaux rares pour limiter la quasi-séparation."""
+    out = df_in.copy()
+    cat_in_data = [c for c in candidate_variables if c in out.columns and c in categorical_features]
+
+    if 'Gender' in cat_in_data:
+        g = out['Gender'].astype('string').str.strip()
+        out['Gender'] = g.replace({'M': 'Male', 'm': 'Male', 'F': 'Female', 'f': 'Female'})
+
+    for col in cat_in_data:
+        s = out[col].astype('string').str.strip()
+        counts = s.value_counts(dropna=True)
+        rare_levels = set(counts[counts < min_count].index)
+        if rare_levels:
+            s = s.where(~s.isin(rare_levels), other='__RARE__')
+        out[col] = s
+
+    return out
+
 # -------------------------------------------------------------------
 # HELPER FONCTIONS
 # -------------------------------------------------------------------
 def compute_e_value(coef, se, is_binary=True):
     """
     Calcule la E-value pour une estimation (Risk Ratio, Odds Ratio, Hazard Ratio)
-    ou pour une différence de moyennes standardisée (si is_binary=False).
+    ou pour une différence de moyennes standardisées (si is_binary=False).
 
     Ref: VanderWeele, T. J., & Ding, P. (2017).
          Sensitivity Analysis in Observational Research: Introducing the E-Value.
@@ -143,17 +200,20 @@ def compute_e_value(coef, se, is_binary=True):
     # IC95% Wald: beta ± 1.96 * SE.
     z = 1.96
 
+    def _safe_exp(x):
+        return float(np.exp(np.clip(x, -MAX_LOG_EXP_INPUT, MAX_LOG_EXP_INPUT)))
+
     if is_binary:
         # Cas logit/cox: le coef est sur l'échelle log-ratio.
-        rr_point = float(np.exp(coef))
-        rr_ci_low = float(np.exp(coef - z * se))
-        rr_ci_high = float(np.exp(coef + z * se))
+        rr_point = _safe_exp(coef)
+        rr_ci_low = _safe_exp(coef - z * se)
+        rr_ci_high = _safe_exp(coef + z * se)
     else:
         # Cas continu: approximation SMD -> RR-like.
         # (VanderWeele & Ding, 2017): RR ≈ exp(0.91 * SMD)
-        rr_point = float(np.exp(0.91 * coef))
-        rr_ci_low = float(np.exp(0.91 * (coef - z * se)))
-        rr_ci_high = float(np.exp(0.91 * (coef + z * se)))
+        rr_point = _safe_exp(0.91 * coef)
+        rr_ci_low = _safe_exp(0.91 * (coef - z * se))
+        rr_ci_high = _safe_exp(0.91 * (coef + z * se))
 
     e_value_point = _evalue_from_ratio(rr_point)
 
@@ -300,32 +360,39 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
         # has_inference : Flag indiquant si stats inférentielles sont disponibles
 
         if is_binary:
-            # ÉTAPE 1: Fit régularisé L1 pour obtenir des coefficients stables
-            # (même en cas de séparation parfaite ou quasi-séparation)
-            coef_model = Logit(y, X).fit_regularized(
-                method='l1',
-                alpha=0.001,  # Très faible pénalité (minimal bias)
-                disp=False,
-                maxiter=1000,
-                trim_mode='auto'
+            # Fit sklearn binaire, plus stable numériquement que statsmodels.Logit ici
+            clf = LogisticRegression(
+                penalty='l1',
+                solver='liblinear',
+                C=LOGIT_STABILITY_C,
+                max_iter=LOGIT_CV_MAX_ITER,
+                tol=LOGIT_CV_TOL,
+                class_weight='balanced',
+                fit_intercept=False,
+                random_state=RANDOM_SEED,
             )
+            clf.fit(X.values, y.values)
+            coef_model = SimpleNamespace(params=pd.Series(clf.coef_.ravel(), index=X.columns))
 
-            # ÉTAPE 2: Essayer un fit MLE classique (sans pénalité) pour l'inférence
-            # Cela peut échouer si séparation/quasi-séparation → fallback sans SE/p-val
-            try:
-                inference_model = Logit(y, X).fit(
-                    disp=False,
-                    maxiter=500,
-                    method='bfgs'
-                )
-                conf_int = inference_model.conf_int()
-                has_inference = True  # Stats inférentielles disponibles ✓
-            except Exception as exc:
-                # Fit MLE a échoué → on garde coef_model mais pas d'inférence
-                log_warning(f"Fit MLE échoué pour {target}; fallback sur coefficients régularisés", exc)
+            # Inférence GLM Binomiale (plus stable que Logit direct sur ces données).
+            if ENABLE_BINARY_MLE_INFERENCE:
+                try:
+                    with warnings.catch_warnings(record=True) as caught_glm:
+                        warnings.simplefilter('always', category=RuntimeWarning)
+                        inference_model = sm.GLM(y, X, family=sm.families.Binomial()).fit(maxiter=300)
+                    if caught_glm:
+                        print(f"   Warning: GLM inference a émis {len(caught_glm)} warning(s) pour {target}")
+                    conf_int = inference_model.conf_int()
+                    has_inference = True
+                except Exception as exc:
+                    log_warning(f"Fit MLE échoué pour {target}; p-values indisponibles", exc)
+                    inference_model = None
+                    conf_int = None
+                    has_inference = False
+            else:
                 inference_model = None
                 conf_int = None
-                has_inference = False  # Inférence indisponible, on skipera SE/p-val
+                has_inference = False
         else:
             # Cas continu (OLS): un seul fit suffit (rarement d'instabilité numérique)
             coef_model = OLS(y, X).fit()
@@ -402,9 +469,10 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
                     'e_value_point': np.nan, 'e_value_ci': np.nan
                 }
 
-            # ENREGISTREMENT: Une ligne = une variable avec toutes ses stats
+            # Une ligne = une variable avec toutes ses stats
             rows.append({
                 'feature': param,
+                'feature_original': map_feature_to_original(param, selected_features),
                 'coef': beta,
                 'se': se,
                 'p_value': pval,
@@ -442,7 +510,7 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
         'n_obs': int(len(y)),
         'n_features_input': len(selected_features),
         'n_features_encoded': int(X.shape[1] - 1),
-        'model': coef_model,  # Retourner le modèle des coefficients (régularisé si nécessaire)
+        'model': coef_model,  # Modèle de coefficients (sklearn en binaire, OLS sinon)
         'results_df': results_df
     }
 
@@ -492,7 +560,8 @@ def aggregate_results(results_list):
             stacked[col] = pd.to_numeric(stacked[col], errors='coerce')
 
     aggregated_rows = []
-    for feature, grp in stacked.groupby('feature', dropna=True):
+    group_col = 'feature_original' if 'feature_original' in stacked.columns else 'feature'
+    for feature, grp in stacked.groupby(group_col, dropna=True):
         grp = grp.copy()
         pvals = grp['p_value'].dropna().to_numpy(dtype=float)
 
@@ -524,6 +593,7 @@ def aggregate_results(results_list):
 
         aggregated_rows.append({
             'feature': feature,
+            'feature_example_encoded': grp['feature'].dropna().iloc[0] if grp['feature'].notna().any() else feature,
             'target': grp['target'].dropna().iloc[0] if grp['target'].notna().any() else None,
             'is_binary': bool(grp['is_binary'].dropna().iloc[0]) if grp['is_binary'].notna().any() else None,
             'n_folds_present': int(grp['fold_id'].nunique()),
@@ -642,7 +712,13 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
             y_a = df_boot[mediator_col]
             if is_med_binary:
                 # Utiliser régularisation pour éviter séparation parfaite
-                model_a = Logit(y_a, X_a).fit_regularized(method='l1', alpha=0.001, disp=False, maxiter=200)
+                model_a = Logit(y_a, X_a).fit_regularized(
+                    method='l1',
+                    alpha=STATSMODELS_LOGIT_ALPHA,
+                    disp=False,
+                    maxiter=STATSMODELS_LOGIT_MAXITER,
+                    trim_mode='size'
+                )
             else:
                 model_a = OLS(y_a, X_a).fit()
 
@@ -654,7 +730,13 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
             X_b = add_constant(df_boot[[cause_col, mediator_col]], has_constant='add')
             y_b = df_boot[outcome_col]
             if is_out_binary:
-                model_b = Logit(y_b, X_b).fit_regularized(method='l1', alpha=0.001, disp=False, maxiter=200)
+                model_b = Logit(y_b, X_b).fit_regularized(
+                    method='l1',
+                    alpha=STATSMODELS_LOGIT_ALPHA,
+                    disp=False,
+                    maxiter=STATSMODELS_LOGIT_MAXITER,
+                    trim_mode='size'
+                )
             else:
                 model_b = OLS(y_b, X_b).fit()
 
@@ -667,7 +749,13 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
             # Modèle total c: outcome ~ cause
             X_c = add_constant(df_boot[[cause_col]], has_constant='add')
             if is_out_binary:
-                model_c = Logit(y_b, X_c).fit_regularized(method='l1', alpha=0.001, disp=False, maxiter=200)
+                model_c = Logit(y_b, X_c).fit_regularized(
+                    method='l1',
+                    alpha=STATSMODELS_LOGIT_ALPHA,
+                    disp=False,
+                    maxiter=STATSMODELS_LOGIT_MAXITER,
+                    trim_mode='size'
+                )
             else:
                 model_c = OLS(y_b, X_c).fit()
             c_total = float(model_c.params[cause_col])
@@ -692,7 +780,7 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
     seeds = np.random.randint(0, 100000, size=n_boot)
 
     # Parallélisation avec joblib (meilleur pour les stats)
-    results = Parallel(n_jobs=-1, backend='threading')(
+    results = Parallel(n_jobs=BOOTSTRAP_PARALLEL_N_JOBS, backend='threading')(
         delayed(_single_mediation_boot)(seed, data, cause, mediator, outcome, is_mediator_binary, is_outcome_binary)
         for seed in seeds
     )
@@ -778,7 +866,10 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
         }
     """
     cols_to_use = candidates + [target]
-    data = df[cols_to_use].dropna()
+    data = df[cols_to_use].copy()
+    data = coerce_numeric_predictors(data, candidates)
+    data = normalize_categorical_predictors(data, candidates)
+    data = data.dropna()
 
     if len(data) < 50:
         print(f"   Trop peu de données pour {target} (n={len(data)}). Skip.")
@@ -799,29 +890,73 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', StandardScaler(), num_candidates),
-            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=cat_sparse, drop='first'),
+            ('cat', OneHotEncoder(
+                handle_unknown='infrequent_if_exist',
+                min_frequency=OHE_MIN_FREQUENCY,
+                max_categories=OHE_MAX_CATEGORIES,
+                sparse_output=cat_sparse,
+                drop='first'
+            ),
              cat_candidates)
         ],
         verbose_feature_names_out=True
     )
 
     if is_binary_target:
-        model = LogisticRegressionCV(
-            cv=2,
-            penalty='elasticnet',
-            solver='saga',
-            l1_ratios=[0.1, 0.5, 0.9],
-            scoring='roc_auc',
-            max_iter=1000,
-            n_jobs=-1,
-            random_state=random_state
-        )
+        if USE_LOGIT_CV_IN_STABILITY:
+            model = LogisticRegressionCV(
+                cv=2,
+                penalty='elasticnet',
+                solver='saga',
+                l1_ratios=LOGIT_CV_L1_RATIOS,
+                Cs=LOGIT_CV_CS,
+                scoring='roc_auc',
+                max_iter=LOGIT_CV_MAX_ITER,
+                tol=LOGIT_CV_TOL,
+                class_weight='balanced',
+                n_jobs=1,
+                random_state=random_state
+            )
+        else:
+            if BINARY_STABILITY_MODEL == "liblinear_l1":
+                # Très stable en binaire + sparsité naturelle sans warnings SAGA.
+                model = LogisticRegression(
+                    penalty='l1',
+                    solver='liblinear',
+                    C=LOGIT_STABILITY_C,
+                    max_iter=LOGIT_CV_MAX_ITER,
+                    tol=LOGIT_CV_TOL,
+                    class_weight='balanced',
+                    random_state=random_state
+                )
+            elif BINARY_STABILITY_MODEL == "lbfgs_l2":
+                model = LogisticRegression(
+                    penalty='l2',
+                    solver='lbfgs',
+                    C=LOGIT_STABILITY_C,
+                    max_iter=LOGIT_CV_MAX_ITER,
+                    tol=LOGIT_CV_TOL,
+                    class_weight='balanced',
+                    random_state=random_state
+                )
+            else:
+                model = LogisticRegression(
+                    penalty='elasticnet',
+                    solver='saga',
+                    C=LOGIT_STABILITY_C,
+                    l1_ratio=LOGIT_STABILITY_L1_RATIO,
+                    max_iter=LOGIT_CV_MAX_ITER,
+                    tol=LOGIT_CV_TOL,
+                    class_weight='balanced',
+                    n_jobs=1,
+                    random_state=random_state
+                )
     else:
         model = ElasticNetCV(
             l1_ratio=[0.1, 0.5, 0.9],
             cv=3,
             max_iter=5000,
-            n_jobs=-1,
+            n_jobs=1,
             random_state=random_state
         )
 
@@ -853,9 +988,14 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
             )
 
             if y_resampled.nunique() < 2:
-                return set()
+                return {'success': False, 'selected': set(), 'reason': 'single_class', 'n_conv_warn': 0, 'conv_msg': None}
 
-            pipeline_obj.fit(X_resampled, y_resampled)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always', ConvergenceWarning)
+                pipeline_obj.fit(X_resampled, y_resampled)
+
+            conv_warnings = [w for w in caught if issubclass(w.category, ConvergenceWarning)]
+            conv_msg = str(conv_warnings[0].message) if conv_warnings else None
             feature_names = pipeline_obj.named_steps['preprocessor'].get_feature_names_out()
             model_fitted = pipeline_obj.named_steps['model']
             coefs = np.asarray(model_fitted.coef_).ravel()
@@ -868,28 +1008,63 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
                 if orig is not None:
                     selected_original.add(orig)
 
-            return selected_original
+            return {
+                'success': True,
+                'selected': selected_original,
+                'reason': None,
+                'n_conv_warn': len(conv_warnings),
+                'conv_msg': conv_msg,
+            }
         except Exception as exc:
             log_exception(f"Stability selection échouée pour {target} (seed={seed})", exc)
-            return set()
+            return {'success': False, 'selected': set(), 'reason': 'exception', 'n_conv_warn': 0, 'conv_msg': None}
 
     model_name = "LogitCV(elasticnet)" if is_binary_target else "ElasticNetCV"
+    if is_binary_target:
+        if USE_LOGIT_CV_IN_STABILITY:
+            model_name = "LogitCV(elasticnet)"
+        else:
+            model_name = f"Logit({BINARY_STABILITY_MODEL})"
+    else:
+        model_name = "ElasticNetCV"
     print(f"   Running Stability Selection for target: {target} with {n_bootstrap} bootstraps [{model_name}]...")
 
     # Parallélisation avec joblib
-    results = Parallel(n_jobs=-1, backend='threading')(
+    results = Parallel(n_jobs=BOOTSTRAP_PARALLEL_N_JOBS, backend='threading')(
         delayed(_single_stability_iteration)(seed, X, y, clone(pipeline), candidates)
         for seed in seeds
     )
 
     selection_counts = {feature: 0 for feature in candidates}
     n_successful_runs = 0
+    n_empty_selected = 0
+    n_failed_runs = 0
+    n_conv_warning_runs = 0
+    n_conv_warning_total = 0
+    conv_examples = {}
 
-    for selected_original in results:
-        if selected_original:  # Si le set n'est pas vide
-            for feature in selected_original:
-                selection_counts[feature] += 1
-            n_successful_runs += 1
+    for item in results:
+        n_conv = int(item.get('n_conv_warn', 0)) if isinstance(item, dict) else 0
+        if n_conv > 0:
+            n_conv_warning_runs += 1
+            n_conv_warning_total += n_conv
+            msg = item.get('conv_msg')
+            if msg:
+                conv_examples[msg] = conv_examples.get(msg, 0) + 1
+
+        if not isinstance(item, dict) or not item.get('success', False):
+            n_failed_runs += 1
+            continue
+
+        n_successful_runs += 1
+        selected_original = item.get('selected', set())
+        if not selected_original:
+            n_empty_selected += 1
+            continue
+
+        for feature in selected_original:
+            selection_counts[feature] += 1
+
     if n_successful_runs == 0:
         print(f"   Aucune itération réussie pour {target}.")
         return {'selected_features': [], 'stability_scores': {}, 'n_iterations': 0}
@@ -897,7 +1072,18 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
     stability_scores = {feature: count / n_successful_runs for feature, count in selection_counts.items()}
     selected_features = [feature for feature, score in stability_scores.items() if score >= threshold]
 
-    print(f"   Selected {len(selected_features)} features for {target} (threshold={threshold}): {selected_features}")
+    print(
+        f"   Selected {len(selected_features)} features for {target} (threshold={threshold}): {selected_features}"
+    )
+    print(
+        f"   Stats stabilité {target}: success={n_successful_runs}, empty={n_empty_selected}, failed={n_failed_runs}"
+    )
+    if n_conv_warning_total > 0:
+        print(
+            f"   Warnings convergence {target}: runs={n_conv_warning_runs}, total={n_conv_warning_total}"
+        )
+        for msg, count in sorted(conv_examples.items(), key=lambda kv: kv[1], reverse=True)[:3]:
+            print(f"      - x{count}: {msg}")
     return {
         'selected_features': selected_features,
         'stability_scores': stability_scores,
@@ -954,6 +1140,8 @@ def fit_cross_validated_inference(
     # Jeu de données propre commun à toutes les étapes du cross-fitting.
     cols = available_candidates + [target]
     data = df[cols].copy()
+    data = coerce_numeric_predictors(data, available_candidates)
+    data = normalize_categorical_predictors(data, available_candidates)
     data[target] = pd.to_numeric(data[target], errors='coerce')
     data = data.dropna()
 
@@ -1028,7 +1216,7 @@ def fit_cross_validated_inference(
     print(f"Cross-fit {target}: {n_splits} folds (parallélisés)")
 
     # Parallélisation avec joblib
-    results = Parallel(n_jobs=-1, backend='threading')(
+    results = Parallel(n_jobs=FOLD_PARALLEL_N_JOBS, backend='threading')(
         delayed(_process_fold)(i, available_candidates, data, is_binary, split_indices, target, n_bootstrap, stability_threshold)
         for i in range(n_splits)
     )
@@ -1288,7 +1476,7 @@ def main(fast_mode=False):
 
     # Parallélisation au niveau des targets
     print(f"\nParallélisation de {len(all_targets_to_process)} inférences DML...")
-    inference_results = Parallel(n_jobs=-1, backend='threading')(
+    inference_results = Parallel(n_jobs=TARGET_PARALLEL_N_JOBS, backend='threading')(
         delayed(_process_target_inference)(target_info)
         for target_info in all_targets_to_process
     )
@@ -1383,30 +1571,56 @@ def main(fast_mode=False):
     print("PHASE 3 - MÉDIATION BOOTSTRAP")
     print("=" * 80)
 
-    mediation_result = None
-    vaccine_col = 'Vaccine100' if 'Vaccine100' in df.columns else None
-    mediator_col = 'PFS_' if 'PFS_' in df.columns else None
+    mediation_result = []
+    cause_col = 'Vaccine100' if 'Vaccine100' in df.columns else None
     outcome_col = 'OS_event' if 'OS_event' in df.columns else None
 
-    if vaccine_col and mediator_col and outcome_col:
-        mediation_result = bootstrap_mediation_robust(
-            df=df,
-            cause=vaccine_col,
-            mediator=mediator_col,
-            outcome=outcome_col,
-            n_boot=n_bootstrap_mediation,
-            random_seed=RANDOM_SEED
-        )
+    # Priorité à PFS/PFS_Code; sinon fallback sur médiateurs cliniquement plausibles présents.
+    mediator_priority = [
+        'PFS_',
+        'PFS_Code',
+        'Steroid_win_1_month_of_Vaccine',
+        'Steroid_win_1_month_of_ICI_start',
+        'Concurrent_Chemo',
+        'BRAF',
+        'ECOG',
+        'CNS_disease',
+    ]
 
-        if mediation_result is not None:
-            p_indirect = mediation_result['indirect_effect']['p_empirical']
-            ci_low = mediation_result['indirect_effect']['ci_low']
-            ci_high = mediation_result['indirect_effect']['ci_high']
-            print(f"Médiation {vaccine_col} -> {mediator_col} -> {outcome_col}: p={p_indirect:.4f}, IC95%=[{ci_low:.4f}, {ci_high:.4f}]")
+    if cause_col and outcome_col:
+        available_mediators = [m for m in mediator_priority if m in df.columns and m not in {cause_col, outcome_col}]
+        # Garder seulement les médiateurs qui varient réellement.
+        available_mediators = [m for m in available_mediators if pd.to_numeric(df[m], errors='coerce').dropna().nunique() >= 2]
+
+        if available_mediators:
+            mediators_to_run = available_mediators[:3]
+            print(f"Médiateurs testés: {mediators_to_run}")
+
+            for i, mediator_col in enumerate(mediators_to_run):
+                med_res = bootstrap_mediation_robust(
+                    df=df,
+                    cause=cause_col,
+                    mediator=mediator_col,
+                    outcome=outcome_col,
+                    n_boot=n_bootstrap_mediation,
+                    random_seed=RANDOM_SEED + i
+                )
+
+                if med_res is not None:
+                    mediation_result.append(med_res)
+                    p_indirect = med_res['indirect_effect']['p_empirical']
+                    ci_low = med_res['indirect_effect']['ci_low']
+                    ci_high = med_res['indirect_effect']['ci_high']
+                    print(
+                        f"Médiation {cause_col} -> {mediator_col} -> {outcome_col}: "
+                        f"p={p_indirect:.4f}, IC95%=[{ci_low:.4f}, {ci_high:.4f}]"
+                    )
+                else:
+                    print(f"Médiation non concluante pour médiateur {mediator_col} (aucun bootstrap valide)")
         else:
-            print("Médiation non concluante (aucun bootstrap valide)")
+            print("Médiation non exécutée: aucun médiateur disponible avec variance suffisante")
     else:
-        print("Médiation non exécutée (colonnes manquantes)")
+        print("Médiation non exécutée (cause/outcome manquants)")
 
     print("\n" + "=" * 80)
     print("PHASE 4 - EXPORT")
