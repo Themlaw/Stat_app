@@ -26,9 +26,18 @@ from joblib import Parallel, delayed
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import multiprocessing as mp
 
-warnings.filterwarnings('ignore', category=ConvergenceWarning)
-warnings.filterwarnings('ignore', category=UserWarning)
 pd.set_option('display.max_columns', None)
+
+
+def log_exception(context, exc):
+    """Affiche une erreur explicite sans interrompre le pipeline appelant."""
+    print(f"[ERROR] {context} | {type(exc).__name__}: {exc}")
+
+
+def log_warning(context, exc):
+    """Affiche un warning explicite quand un fallback est appliqué."""
+    print(f"[WARN] {context} | {type(exc).__name__}: {exc}")
+
 
 # -------------------------------------------------------------------
 # CONFIGURATION GLOBALE & CONSTANTES
@@ -280,8 +289,8 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
             # On log seulement si > 1e15 (singularité vraie)
             if cond_number > 1e15:
                 print(f"   Warning: Matrice quasi-singulière détectée (cond={cond_number:.2e})")
-        except:
-            pass
+        except Exception as exc:
+            log_warning(f"cond_number indisponible pour {target}", exc)
 
     try:
         # STRATÉGIE: Séparer coefficients robustes et inférence statistique
@@ -311,8 +320,9 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
                 )
                 conf_int = inference_model.conf_int()
                 has_inference = True  # Stats inférentielles disponibles ✓
-            except Exception:
+            except Exception as exc:
                 # Fit MLE a échoué → on garde coef_model mais pas d'inférence
+                log_warning(f"Fit MLE échoué pour {target}; fallback sur coefficients régularisés", exc)
                 inference_model = None
                 conf_int = None
                 has_inference = False  # Inférence indisponible, on skipera SE/p-val
@@ -378,7 +388,8 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
             if np.isfinite(se) and se > 0:
                 try:
                     e_val = compute_e_value(beta, se, is_binary=is_binary)
-                except Exception:
+                except Exception as exc:
+                    log_warning(f"compute_e_value échoué pour {target}/{param}", exc)
                     # Fallback si compute_e_value échoue
                     e_val = {
                         'rr_point': np.nan, 'rr_ci_low': np.nan, 'rr_ci_high': np.nan,
@@ -409,7 +420,7 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
                 'e_value_ci': e_val['e_value_ci']
             })
     except Exception as e:
-        print(f"   Erreur lors de l'ajustement du modèle pour {target} avec {len(selected_features)} features: {e}")
+        log_exception(f"Ajustement modèle échoué pour {target} avec {len(selected_features)} features", e)
         return {
             'target': target,
             'is_binary': is_binary,
@@ -670,7 +681,11 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
                 'total': c_total,
                 'success': True
             }
-        except Exception:
+        except Exception as exc:
+            log_exception(
+                f"Bootstrap médiation échoué (seed={boot_seed}, path={cause_col}->{mediator_col}->{outcome_col})",
+                exc,
+            )
             return {'success': False}
 
     print(f"Bootstrap mediation {cause}->{mediator}->{outcome}: {n_boot} itérations (parallélisées)")
@@ -854,7 +869,8 @@ def run_stability_selection(df, candidates, target="OS_event", n_bootstrap=100, 
                     selected_original.add(orig)
 
             return selected_original
-        except Exception:
+        except Exception as exc:
+            log_exception(f"Stability selection échouée pour {target} (seed={seed})", exc)
             return set()
 
     model_name = "LogitCV(elasticnet)" if is_binary_target else "ElasticNetCV"
