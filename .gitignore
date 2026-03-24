@@ -4,7 +4,7 @@ code/
 infos/
 data/
 Note_de_synthèse_statapp_DAG.pdf
-covid_training/src/test.ipynb
+src/test.ipynb
 .idea/
 test.ipynb
 *__pycache__/
