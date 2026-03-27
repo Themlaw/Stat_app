@@ -7,4 +7,5 @@ Note_de_synthèse_statapp_DAG.pdf
 src/test.ipynb
 .idea/
 test.ipynb
-*__pycache__/
+*/test.py
+**/__pycache__/
