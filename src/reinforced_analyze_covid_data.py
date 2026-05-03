@@ -611,6 +611,13 @@ def aggregate_results(results_list):
     group_col = 'feature_original' if 'feature_original' in stacked.columns else 'feature'
     for feature, grp in stacked.groupby(group_col, dropna=True):
         grp = grp.copy()
+        
+        # Extraire is_binary du groupe actuel (partagé par tous les folds du même target)
+        if 'is_binary' in grp.columns and grp['is_binary'].notna().any():
+            is_binary = bool(grp['is_binary'].dropna().iloc[0])
+        else:
+            is_binary = True
+        
         pvals = grp['p_value'].dropna().to_numpy(dtype=float)
 
         if len(pvals) == 0:
