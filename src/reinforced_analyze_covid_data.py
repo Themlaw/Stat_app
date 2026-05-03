@@ -548,24 +548,6 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
         }
         
     results_df = pd.DataFrame(rows)
-    if not results_df.empty:
-        results_df = results_df.sort_values('p_value').reset_index(drop=True)
-        
-        # --- Affichage propre des résultats d'inférence ---
-        print(f"\n      Inférence du modèle non-pénalisé ({target})")
-        display_cols = ['feature', 'effect_point', 'p_value', 'e_value_point']
-        rename_map = {
-            'feature': 'Variable',
-            'effect_point': 'Effet (OR/Coef)',
-            'p_value': 'p-value',
-            'e_value_point': 'E-value'
-        }
-        
-        actual_cols = [c for c in display_cols if c in results_df.columns]
-        summary_df = results_df[actual_cols].rename(columns=rename_map)
-        
-        print(tabulate(summary_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
-
     return {
         'target': target,
         'is_binary': is_binary,
@@ -642,41 +624,44 @@ def aggregate_results(results_list):
             p_fisher = float(p_fisher)
 
         coef_vals = grp['coef'].dropna().to_numpy(dtype=float)
-        coef_mean = float(np.mean(coef_vals)) if len(coef_vals) else np.nan
-        coef_std = float(np.std(coef_vals, ddof=1)) if len(coef_vals) > 1 else 0.0
+        se_vals = grp['se'].dropna().to_numpy(dtype=float)
+        
+        n_folds = len(coef_vals)
+        coef_mean = float(np.mean(coef_vals)) if n_folds > 0 else np.nan
+        
+        # Pooled SE for the mean of independent folds: SE_avg = sqrt(sum(SE_i^2)) / K
+        if len(se_vals) > 0:
+            pooled_se = np.sqrt(np.sum(se_vals**2)) / len(se_vals)
+        else:
+            pooled_se = np.nan
 
-        ci_low_mean = float(np.nanmean(grp['ci_low'])) if grp['ci_low'].notna().any() else np.nan
-        ci_high_mean = float(np.nanmean(grp['ci_high'])) if grp['ci_high'].notna().any() else np.nan
-        effect_point_mean = float(np.nanmean(grp['effect_point'])) if grp['effect_point'].notna().any() else np.nan
-        effect_ci_low_mean = float(np.nanmean(grp['effect_ci_low'])) if grp['effect_ci_low'].notna().any() else np.nan
-        effect_ci_high_mean = float(np.nanmean(grp['effect_ci_high'])) if grp['effect_ci_high'].notna().any() else np.nan
-
-        rr_like_mean = float(np.nanmean(grp['rr_like'])) if grp['rr_like'].notna().any() else np.nan
-        rr_like_ci_low_mean = float(np.nanmean(grp['rr_like_ci_low'])) if grp['rr_like_ci_low'].notna().any() else np.nan
-        rr_like_ci_high_mean = float(np.nanmean(grp['rr_like_ci_high'])) if grp['rr_like_ci_high'].notna().any() else np.nan
-        e_value_point_mean = float(np.nanmean(grp['e_value_point'])) if grp['e_value_point'].notna().any() else np.nan
-        e_value_ci_mean = float(np.nanmean(grp['e_value_ci'])) if grp['e_value_ci'].notna().any() else np.nan
+        # Recalculate consensus E-value and Effect size from aggregated parameters
+        if np.isfinite(coef_mean) and np.isfinite(pooled_se) and pooled_se > 0:
+            try:
+                e_val_final = compute_e_value(coef_mean, pooled_se, is_binary=is_binary)
+            except Exception:
+                e_val_final = {'rr_point': np.nan, 'e_value_point': np.nan, 'e_value_ci': np.nan}
+        else:
+            # Fallback for point estimate only if SE is missing
+            if is_binary and np.isfinite(coef_mean):
+                rr_pt = float(np.exp(np.clip(coef_mean, -20, 20)))
+            else:
+                rr_pt = coef_mean
+            e_val_final = {'rr_point': rr_pt, 'e_value_point': np.nan, 'e_value_ci': np.nan}
 
         aggregated_rows.append({
             'feature': feature,
             'feature_example_encoded': grp['feature'].dropna().iloc[0] if grp['feature'].notna().any() else feature,
             'target': grp['target'].dropna().iloc[0] if grp['target'].notna().any() else None,
-            'is_binary': bool(grp['is_binary'].dropna().iloc[0]) if grp['is_binary'].notna().any() else None,
+            'is_binary': is_binary,
             'n_folds_present': int(grp['fold_id'].nunique()),
             'fisher_stat': fisher_stat,
             'p_value_fisher': p_fisher,
             'coef_mean': coef_mean,
-            'coef_std': coef_std,
-            'ci_low_mean': ci_low_mean,
-            'ci_high_mean': ci_high_mean,
-            'effect_point_mean': effect_point_mean,
-            'effect_ci_low_mean': effect_ci_low_mean,
-            'effect_ci_high_mean': effect_ci_high_mean,
-            'rr_like_mean': rr_like_mean,
-            'rr_like_ci_low_mean': rr_like_ci_low_mean,
-            'rr_like_ci_high_mean': rr_like_ci_high_mean,
-            'e_value_point_mean': e_value_point_mean,
-            'e_value_ci_mean': e_value_ci_mean
+            'pooled_se': pooled_se,
+            'effect_point_mean': e_val_final['rr_point'],
+            'e_value_point': e_val_final['e_value_point'],
+            'e_value_ci': e_val_final['e_value_ci']
         })
 
     out = pd.DataFrame(aggregated_rows)
@@ -699,6 +684,31 @@ def aggregate_results(results_list):
 
     # Final output sorted by combined statistical signal.
     out = out.sort_values(['p_value_fisher', 'feature'], na_position='last').reset_index(drop=True)
+
+    # Printing the e_value 
+    if not out.empty:
+        target_name = out['target'].iloc[0] if 'target' in out.columns else "Unknown"
+        print(f"\n      >>> Synthèse Finale : Inférence Agrégée ({target_name}) <<<")
+        
+        display_cols = ['feature', 'effect_point_mean', 'p_value_fisher', 'p_value_fdr_bh', 'e_value_point']
+        rename_map = {
+            'feature': 'Variable',
+            'effect_point_mean': 'Effet (Consensus)',
+            'p_value_fisher': 'p (Fisher)',
+            'p_value_fdr_bh': 'p (FDR)',
+            'e_value_point': 'E-value'
+        }
+        
+        actual_cols = [c for c in display_cols if c in out.columns]
+        summary_df = out[actual_cols].rename(columns=rename_map)
+        
+        try:
+            from tabulate import tabulate
+            print(tabulate(summary_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
+        except ImportError:
+            print(summary_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+        print("      " + "=" * 65)
+
     return out
 
 def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random_seed=42):
