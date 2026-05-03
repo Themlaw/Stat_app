@@ -1696,10 +1696,9 @@ def main(fast_mode=False):
 
     print(f"Causal links after Cox audit: {len(all_links)}")
 
-    # --- AFFICHAGE DU MODÈLE CAUSAL FINAL ---
+    # Printing causal modal
     if all_links:
         print("E-values du modèle final")
-        print("!" * 80)
         
         final_df = pd.DataFrame(all_links)
         display_df = final_df[['from', 'to', 'coef', 'p_value', 'e_value']].copy()
@@ -1707,7 +1706,6 @@ def main(fast_mode=False):
         display_df = display_df.sort_values(['Cible', 'p-value'])
         
         print(tabulate(display_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
-        print("!" * 80 + "\n")
 
     print("\n" + "=" * 80)
     print("PHASE 3 - BOOTSTRAP MEDIATION")
