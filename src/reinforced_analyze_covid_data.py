@@ -692,30 +692,6 @@ def aggregate_results(results_list):
     # Final output sorted by combined statistical signal.
     out = out.sort_values(['p_value_fisher', 'feature'], na_position='last').reset_index(drop=True)
 
-    # Printing the e_value 
-    if not out.empty:
-        target_name = out['target'].iloc[0] if 'target' in out.columns else "Unknown"
-        print(f"\n      >>> Synthèse Finale : Inférence Agrégée ({target_name}) <<<")
-        
-        display_cols = ['feature', 'effect_point_mean', 'p_value_fisher', 'p_value_fdr_bh', 'e_value_point']
-        rename_map = {
-            'feature': 'Variable',
-            'effect_point_mean': 'Effet (Consensus)',
-            'p_value_fisher': 'p (Fisher)',
-            'p_value_fdr_bh': 'p (FDR)',
-            'e_value_point': 'E-value'
-        }
-        
-        actual_cols = [c for c in display_cols if c in out.columns]
-        summary_df = out[actual_cols].rename(columns=rename_map)
-        
-        try:
-            from tabulate import tabulate
-            print(tabulate(summary_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
-        except ImportError:
-            print(summary_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-        print("      " + "=" * 65)
-
     return out
 
 def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random_seed=42):
@@ -1669,7 +1645,7 @@ def main(fast_mode=False):
                 'to': target,
                 'coef': float(row.get('coef_mean', np.nan)),
                 'p_value': float(row.get('p_value_fdr_bh', np.nan)),
-                'e_value': float(row.get('e_value_point_mean', np.nan)),
+                'e_value': float(row.get('e_value_point', np.nan)),
                 'stability': float(stability_map.get(src_original, np.nan)),
                 'method': 'cross_fitted_dml'
             })
@@ -1719,6 +1695,19 @@ def main(fast_mode=False):
         print(f"Cox skipped: {cox_result.get('reason', 'unknown reason')}")
 
     print(f"Causal links after Cox audit: {len(all_links)}")
+
+    # --- AFFICHAGE DU MODÈLE CAUSAL FINAL ---
+    if all_links:
+        print("E-values du modèle final")
+        print("!" * 80)
+        
+        final_df = pd.DataFrame(all_links)
+        display_df = final_df[['from', 'to', 'coef', 'p_value', 'e_value']].copy()
+        display_df.columns = ['Source', 'Cible', 'Effet (Log-scale)', 'p-value', 'E-value']
+        display_df = display_df.sort_values(['Cible', 'p-value'])
+        
+        print(tabulate(display_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
+        print("!" * 80 + "\n")
 
     print("\n" + "=" * 80)
     print("PHASE 3 - BOOTSTRAP MEDIATION")
