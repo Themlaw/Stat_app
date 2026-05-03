@@ -21,6 +21,8 @@ from statsmodels.tools import add_constant
 from statsmodels.discrete.discrete_model import Logit
 from statsmodels.regression.linear_model import OLS
 import statsmodels.api as sm
+from tabulate import tabulate
+
 
 from joblib import Parallel, delayed
 
@@ -548,6 +550,21 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
     results_df = pd.DataFrame(rows)
     if not results_df.empty:
         results_df = results_df.sort_values('p_value').reset_index(drop=True)
+        
+        # --- Affichage propre des résultats d'inférence ---
+        print(f"\n      Inférence du modèle non-pénalisé ({target})")
+        display_cols = ['feature', 'effect_point', 'p_value', 'e_value_point']
+        rename_map = {
+            'feature': 'Variable',
+            'effect_point': 'Effet (OR/Coef)',
+            'p_value': 'p-value',
+            'e_value_point': 'E-value'
+        }
+        
+        actual_cols = [c for c in display_cols if c in results_df.columns]
+        summary_df = results_df[actual_cols].rename(columns=rename_map)
+        
+        print(tabulate(summary_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
 
     return {
         'target': target,
