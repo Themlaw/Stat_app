@@ -223,7 +223,6 @@ def main():
         df['Gender'] = df['Gender'].replace({'M': 'Male', 'm': 'Male', 'F': 'Female', 'f': 'Female'})
         print("INFO: Standardized 'Gender' column (Merged M/Male and F/Female).")
 
-    # ---------------------------------------------------------
 
     missing_cols = [col for col in CORE_VARIABLES if col not in df.columns]
     if missing_cols:
