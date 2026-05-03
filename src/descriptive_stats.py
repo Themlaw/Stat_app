@@ -212,13 +212,23 @@ def main():
         return
 
     print("INFO: Loading cleaned dataset...")
-    # Load data and filter to core variables
+    # Load data
     df = pd.read_csv(DATA_PATH)
     
+
+    # Fix Gender standardization issues
+    if 'Gender' in df.columns:
+        # Strip whitespaces and replace variations to unify categories
+        df['Gender'] = df['Gender'].astype('string').str.strip()
+        df['Gender'] = df['Gender'].replace({'M': 'Male', 'm': 'Male', 'F': 'Female', 'f': 'Female'})
+        print("INFO: Standardized 'Gender' column (Merged M/Male and F/Female).")
+
+
     missing_cols = [col for col in CORE_VARIABLES if col not in df.columns]
     if missing_cols:
         raise ValueError(f"CRITICAL ERROR: Missing core variables in the dataset: {missing_cols}")
         
+    # Filter to core variables
     df_filtered = df[CORE_VARIABLES].copy()
     
     # Preprocess strings in continuous columns before dropping NAs
