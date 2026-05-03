@@ -29,9 +29,10 @@ The DAG rendering pipeline is in `src/reinforced_make_dag.py`:
 
 ## Global pipeline
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./ressources/schema_dark.svg" width="85%">
-  <img alt="Architecture de la pipeline de causalité" src="./ressources/schema_light.svg" width="85%">
+  <source media="(prefers-color-scheme: dark)" srcset="./ressources/schema_dark.svg" width="80%">
+  <img alt="Architecture de la pipeline de causalité" src="./ressources/schema_light.svg" width="80%">
 </picture>
+
 ## Project structure
 
 ```text
