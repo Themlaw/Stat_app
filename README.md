@@ -40,7 +40,6 @@ src/
   preparation_covid_data.py            # Build combined dataset from Excel sheets
   reinforced_analyze_covid_data.py     # Main causal analysis pipeline (phases 0-4)
   reinforced_make_dag.py               # DAG pruning + rendering
-  RECAP_CHANGEMENTS_REINFORCED_ANALYZE.md
 
 data/
   combined_covid_data.csv
@@ -56,6 +55,12 @@ data/
 
     ```shell
     pip install uv
+    ```
+    
+    or install directly `uv` tool from the official website:
+
+    ```text
+    https://docs.astral.sh/uv/getting-started/installation/
     ```
 
 2.  Create a virtual environment and download packages:
