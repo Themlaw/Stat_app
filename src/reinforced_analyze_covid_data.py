@@ -1645,7 +1645,12 @@ def main(fast_mode=False):
                 'to': target,
                 'coef': float(row.get('coef_mean', np.nan)),
                 'p_value': float(row.get('p_value_fdr_bh', np.nan)),
+                # Effect size on RR-like scale (from aggregated results)
+                'effect_rr': float(row.get('effect_point_mean', np.nan)),
+                # Pooled standard error across folds (if available)
+                'pooled_se': float(row.get('pooled_se', np.nan)),
                 'e_value': float(row.get('e_value_point', np.nan)),
+                'e_value_ci': float(row.get('e_value_ci', np.nan)),
                 'stability': float(stability_map.get(src_original, np.nan)),
                 'method': 'cross_fitted_dml'
             })
@@ -1701,10 +1706,27 @@ def main(fast_mode=False):
         print("E-values du modèle final")
         
         final_df = pd.DataFrame(all_links)
-        display_df = final_df[['from', 'to', 'coef', 'p_value', 'e_value']].copy()
-        display_df.columns = ['Source', 'Cible', 'Effet (Log-scale)', 'p-value', 'E-value']
-        display_df = display_df.sort_values(['Cible', 'p-value'])
-        
+        # Include pooled SE, RR-like point estimate and E-value CI when available
+        cols_to_show = ['from', 'to', 'coef', 'p_value', 'effect_rr', 'pooled_se', 'e_value', 'e_value_ci']
+        # Ensure missing columns don't crash selection
+        available_cols = [c for c in cols_to_show if c in final_df.columns]
+        display_df = final_df[available_cols].copy()
+        # Friendly column labels (French)
+        col_names = {
+            'from': 'Source',
+            'to': 'Cible',
+            'coef': 'Effet (Log-scale)',
+            'p_value': 'p-value',
+            'effect_rr': 'RR (point)',
+            'pooled_se': 'SE_pooled',
+            'e_value': 'E-value',
+            'e_value_ci': 'E-value_CI'
+        }
+        display_df = display_df.rename(columns=col_names)
+        # Sort and print
+        sort_keys = [k for k in ['Cible', 'p-value'] if k in display_df.columns]
+        if sort_keys:
+            display_df = display_df.sort_values(sort_keys)
         print(tabulate(display_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
 
     print("\n" + "=" * 80)
