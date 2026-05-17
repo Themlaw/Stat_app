@@ -1882,6 +1882,12 @@ def main(fast_mode=False):
     print("=" * 80)
 
     export_path = SCRIPT_DIR / "../data/reinforced_causal_dag_structured.csv"
+    
+    # Final standardization of target names (especially for survival)
+    for link in all_links:
+        if link.get('to') in ['OS', 'OS_months', 'OS_event']:
+            link['to'] = 'Overall_Survival'
+            
     links_df = pd.DataFrame(all_links)
     links_df.to_csv(export_path, index=False, encoding='utf-8-sig')
 

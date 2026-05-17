@@ -191,8 +191,9 @@ def apply_causal_pruning(df, p_threshold=0.05, stability_threshold=0.65, use_eva
     print(f"After p-value filter <= {p_threshold:.3f}: {len(out)}")
 
     # 2) Minimum stability filter
-    out = out[out["stability_stat"].fillna(0.0) >= stability_threshold].copy()
-    print(f"After stability filter >= {stability_threshold:.2f}: {len(out)}")
+    # Bypass for NaN (structural/rescued links that don't pass through DML stability selection)
+    out = out[out["stability_stat"].isna() | (out["stability_stat"] >= stability_threshold)].copy()
+    print(f"After stability filter >= {stability_threshold:.2f} (NaN kept): {len(out)}")
 
     # 3) E-value robustness filter
     if use_evalue:
