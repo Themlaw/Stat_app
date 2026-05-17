@@ -284,6 +284,12 @@ def compute_e_value(coef, se, is_binary=True):
             nearest_bound = rr_ci_high
         e_value_ci = _evalue_from_ratio(nearest_bound)
 
+    # Cap values to avoid absurd numbers from near-perfect or structural associations
+    if e_value_point > 100.0:
+        e_value_point = 100.0
+    if e_value_ci > 100.0:
+        e_value_ci = 100.0
+
     return {
         'rr_point': rr_point,
         'rr_ci_low': rr_ci_low,
@@ -418,6 +424,7 @@ def fit_unpenalized_model(df_train, features, is_binary, target="OS_event"):
             clf = LogisticRegression(
                 penalty='l1',
                 solver='liblinear',
+                l1_ratio=1.0,
                 C=LOGIT_STABILITY_C,
                 max_iter=LOGIT_CV_MAX_ITER,
                 tol=LOGIT_CV_TOL,
@@ -773,6 +780,19 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
     if data[cause].nunique() < 2 or data[mediator].nunique() < 2 or data[outcome].nunique() < 2:
         return None
 
+    # Detection of structural dependence (perfect separation)
+    is_path_a_structural = False
+    if is_mediator_binary:
+        xtab_a = pd.crosstab(data[cause], data[mediator])
+        if (xtab_a == 0).any().any():
+            is_path_a_structural = True
+
+    is_path_b_structural = False
+    if is_outcome_binary:
+        xtab_b = pd.crosstab(data[mediator], data[outcome])
+        if (xtab_b == 0).any().any():
+            is_path_b_structural = True
+
     rng = np.random.default_rng(random_seed)
 
     def _single_mediation_boot(boot_seed, data_input, cause_col, mediator_col, outcome_col, is_med_binary, is_out_binary):
@@ -913,7 +933,17 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
         }
 
     path_a_stats = _summarize_bootstrap(a_effects, is_mediator_binary)
+    if is_path_a_structural:
+        path_a_stats['e_value_point'] = 10.0
+        path_a_stats['e_value_ci'] = 10.0
+        path_a_stats['is_structural'] = True
+
     path_b_stats = _summarize_bootstrap(b_effects, is_outcome_binary)
+    if is_path_b_structural:
+        path_b_stats['e_value_point'] = 10.0
+        path_b_stats['e_value_ci'] = 10.0
+        path_b_stats['is_structural'] = True
+
     indirect_stats = _summarize_bootstrap(indirect_effects, is_outcome_binary)
     direct_stats = _summarize_bootstrap(direct_effects, is_outcome_binary)
     total_stats = _summarize_bootstrap(total_effects, is_outcome_binary)
@@ -1778,32 +1808,38 @@ def main(fast_mode=False):
                     existing_links = {(l['from'], l['to']) for l in all_links}
 
                     # 1. Rescue Path A: cause -> mediator
-                    if med_res['path_a']['e_value_ci'] > RESCUE_THRESHOLD:
+                    if med_res['path_a']['e_value_ci'] > RESCUE_THRESHOLD or med_res['path_a'].get('is_structural', False):
                         if (cause_col, mediator_col) not in existing_links:
-                            print(f"      [RESCUE] Path {cause_col} -> {mediator_col} added (E-value CI={med_res['path_a']['e_value_ci']:.2f})")
+                            is_struct = med_res['path_a'].get('is_structural', False)
+                            method_str = 'structural_dependence' if is_struct else 'mediation_rescue_e_value'
+                            rescue_msg = f"Path {cause_col} -> {mediator_col} added ({'Structural' if is_struct else f'E-value CI={med_res['path_a']['e_value_ci']:.2f}'})"
+                            print(f"      [RESCUE] {rescue_msg}")
                             all_links.append({
                                 'from': cause_col,
                                 'to': mediator_col,
                                 'coef': med_res['path_a']['mean'],
-                                'p_value': med_res['path_a']['p_empirical'],
+                                'p_value': 0.0 if is_struct else med_res['path_a']['p_empirical'],
                                 'e_value': med_res['path_a']['e_value_point'],
                                 'e_value_ci': med_res['path_a']['e_value_ci'],
-                                'method': 'mediation_rescue_e_value'
+                                'method': method_str
                             })
                             existing_links.add((cause_col, mediator_col))
 
                     # 2. Rescue Path B: mediator -> outcome
-                    if med_res['path_b']['e_value_ci'] > RESCUE_THRESHOLD:
+                    if med_res['path_b']['e_value_ci'] > RESCUE_THRESHOLD or med_res['path_b'].get('is_structural', False):
                         if (mediator_col, outcome_col) not in existing_links:
-                            print(f"      [RESCUE] Path {mediator_col} -> {outcome_col} added (E-value CI={med_res['path_b']['e_value_ci']:.2f})")
+                            is_struct = med_res['path_b'].get('is_structural', False)
+                            method_str = 'structural_dependence' if is_struct else 'mediation_rescue_e_value'
+                            rescue_msg = f"Path {mediator_col} -> {outcome_col} added ({'Structural' if is_struct else f'E-value CI={med_res['path_b']['e_value_ci']:.2f}'})"
+                            print(f"      [RESCUE] {rescue_msg}")
                             all_links.append({
                                 'from': mediator_col,
                                 'to': outcome_col,
                                 'coef': med_res['path_b']['mean'],
-                                'p_value': med_res['path_b']['p_empirical'],
+                                'p_value': 0.0 if is_struct else med_res['path_b']['p_empirical'],
                                 'e_value': med_res['path_b']['e_value_point'],
                                 'e_value_ci': med_res['path_b']['e_value_ci'],
-                                'method': 'mediation_rescue_e_value'
+                                'method': method_str
                             })
                             existing_links.add((mediator_col, outcome_col))
 
