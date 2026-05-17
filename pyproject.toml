@@ -3,20 +3,20 @@ name = "stat-app"
 version = "0.1.0"
 description = "Causal DAG Analysis for COVID-19 Vaccine Impact Study"
 readme = "README.md"
-requires-python = "==3.12"
+requires-python = "==3.12.0"
 dependencies = [
-    "pandas==2.2.0",
-    "numpy==2.0.0",
-    "scikit-learn==1.5.0",
-    "matplotlib==3.8.0",
-    "networkx==3.3",
-    "lifelines==0.30.0",
-    "statsmodels==0.14.0",
-    "openpyxl==3.1.0",
-    "tqdm==4.67.3",
-    "pandas-stubs==2.3.3",
-    "tableone==0.9.6",
-    "tabulate==0.10.0",
+    "lifelines>=0.30.3",
+    "matplotlib>=3.10.9",
+    "networkx>=3.6.1",
+    "numpy>=2.3.5",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "pandas-stubs>=3.0.0.260204",
+    "scikit-learn>=1.8.0",
+    "statsmodels>=0.14.6",
+    "tableone>=0.9.6",
+    "tabulate>=0.10.0",
+    "tqdm>=4.67.3",
 ]
 
 [dependency-groups]
