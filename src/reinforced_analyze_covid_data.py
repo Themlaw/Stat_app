@@ -839,6 +839,8 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
                 return {'success': False}
 
             return {
+                'a': a_coef,
+                'b': b_coef,
                 'indirect': a_coef * b_coef,
                 'direct': c_prime,
                 'total': c_total,
@@ -860,6 +862,8 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
         for seed in seeds
     )
 
+    a_effects = []
+    b_effects = []
     indirect_effects = []
     direct_effects = []
     total_effects = []
@@ -867,6 +871,8 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
 
     for res in results:
         if res.get('success', False):
+            a_effects.append(res['a'])
+            b_effects.append(res['b'])
             indirect_effects.append(res['indirect'])
             direct_effects.append(res['direct'])
             total_effects.append(res['total'])
@@ -876,24 +882,41 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
     if len(indirect_effects) == 0:
         return None
 
-    def _summarize_bootstrap(samples):
+    def _summarize_bootstrap(samples, is_binary_target=True):
         arr = np.asarray(samples, dtype=float)
         mean_val = float(np.mean(arr))
+        sd_val = float(np.std(arr))
         ci_low = float(np.percentile(arr, 2.5))
         ci_high = float(np.percentile(arr, 97.5))
         prop_pos = float(np.mean(arr > 0))
         p_emp = float(2 * min(prop_pos, 1 - prop_pos))
+
+        # E-value: treat bootstrap SD as SE for robustness check
+        try:
+            # We only compute E-value if SD is valid
+            if sd_val > 0:
+                e_val = compute_e_value(mean_val, sd_val, is_binary=is_binary_target)
+            else:
+                e_val = {'e_value_point': 1.0, 'e_value_ci': 1.0}
+        except Exception:
+            e_val = {'e_value_point': 1.0, 'e_value_ci': 1.0}
+
         return {
             'mean': mean_val,
+            'sd': sd_val,
             'ci_low': ci_low,
             'ci_high': ci_high,
             'prop_positive': prop_pos,
-            'p_empirical': p_emp
+            'p_empirical': p_emp,
+            'e_value_point': e_val.get('e_value_point', 1.0),
+            'e_value_ci': e_val.get('e_value_ci', 1.0)
         }
 
-    indirect_stats = _summarize_bootstrap(indirect_effects)
-    direct_stats = _summarize_bootstrap(direct_effects)
-    total_stats = _summarize_bootstrap(total_effects)
+    path_a_stats = _summarize_bootstrap(a_effects, is_mediator_binary)
+    path_b_stats = _summarize_bootstrap(b_effects, is_outcome_binary)
+    indirect_stats = _summarize_bootstrap(indirect_effects, is_outcome_binary)
+    direct_stats = _summarize_bootstrap(direct_effects, is_outcome_binary)
+    total_stats = _summarize_bootstrap(total_effects, is_outcome_binary)
 
     mean_total = total_stats['mean']
     mean_indirect = indirect_stats['mean']
@@ -907,6 +930,8 @@ def bootstrap_mediation_robust(df, cause, mediator, outcome, n_boot=1000, random
         'outcome': outcome,
         'is_mediator_binary': bool(is_mediator_binary),
         'is_outcome_binary': bool(is_outcome_binary),
+        'path_a': path_a_stats,
+        'path_b': path_b_stats,
         'indirect_effect': indirect_stats,
         'direct_effect': direct_stats,
         'total_effect': total_stats,
@@ -1701,36 +1726,8 @@ def main(fast_mode=False):
 
     print(f"Causal links after Cox audit: {len(all_links)}")
 
-    # Printing causal modal
-    if all_links:
-        print("E-values du modèle final")
-        
-        final_df = pd.DataFrame(all_links)
-        # Include pooled SE, RR-like point estimate and E-value CI when available
-        cols_to_show = ['from', 'to', 'coef', 'p_value', 'effect_rr', 'pooled_se', 'e_value', 'e_value_ci']
-        # Ensure missing columns don't crash selection
-        available_cols = [c for c in cols_to_show if c in final_df.columns]
-        display_df = final_df[available_cols].copy()
-        # Friendly column labels (French)
-        col_names = {
-            'from': 'Source',
-            'to': 'Cible',
-            'coef': 'Effet (Log-scale)',
-            'p_value': 'p-value',
-            'effect_rr': 'RR (point)',
-            'pooled_se': 'SE_pooled',
-            'e_value': 'E-value',
-            'e_value_ci': 'E-value_CI'
-        }
-        display_df = display_df.rename(columns=col_names)
-        # Sort and print
-        sort_keys = [k for k in ['Cible', 'p-value'] if k in display_df.columns]
-        if sort_keys:
-            display_df = display_df.sort_values(sort_keys)
-        print(tabulate(display_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
-
     print("\n" + "=" * 80)
-    print("PHASE 3 - BOOTSTRAP MEDIATION")
+    print("PHASE 3 - BOOTSTRAP MEDIATION & E-VALUE RESCUE")
     print("=" * 80)
 
     mediation_result = []
@@ -1773,14 +1770,76 @@ def main(fast_mode=False):
                     ci_high = med_res['indirect_effect']['ci_high']
                     print(
                         f"Mediation {cause_col} -> {mediator_col} -> {outcome_col}: "
-                        f"p={p_indirect:.4f}, IC95%=[{ci_low:.4f}, {ci_high:.4f}]"
+                        f"p_indirect={p_indirect:.4f}, IC95%=[{ci_low:.4f}, {ci_high:.4f}]"
                     )
+
+                    # E-value Rescue Logic: add paths missed by DML but robust in mediation
+                    RESCUE_THRESHOLD = 1.25
+                    existing_links = {(l['from'], l['to']) for l in all_links}
+
+                    # 1. Rescue Path A: cause -> mediator
+                    if med_res['path_a']['e_value_ci'] > RESCUE_THRESHOLD:
+                        if (cause_col, mediator_col) not in existing_links:
+                            print(f"      [RESCUE] Path {cause_col} -> {mediator_col} added (E-value CI={med_res['path_a']['e_value_ci']:.2f})")
+                            all_links.append({
+                                'from': cause_col,
+                                'to': mediator_col,
+                                'coef': med_res['path_a']['mean'],
+                                'p_value': med_res['path_a']['p_empirical'],
+                                'e_value': med_res['path_a']['e_value_point'],
+                                'e_value_ci': med_res['path_a']['e_value_ci'],
+                                'method': 'mediation_rescue_e_value'
+                            })
+                            existing_links.add((cause_col, mediator_col))
+
+                    # 2. Rescue Path B: mediator -> outcome
+                    if med_res['path_b']['e_value_ci'] > RESCUE_THRESHOLD:
+                        if (mediator_col, outcome_col) not in existing_links:
+                            print(f"      [RESCUE] Path {mediator_col} -> {outcome_col} added (E-value CI={med_res['path_b']['e_value_ci']:.2f})")
+                            all_links.append({
+                                'from': mediator_col,
+                                'to': outcome_col,
+                                'coef': med_res['path_b']['mean'],
+                                'p_value': med_res['path_b']['p_empirical'],
+                                'e_value': med_res['path_b']['e_value_point'],
+                                'e_value_ci': med_res['path_b']['e_value_ci'],
+                                'method': 'mediation_rescue_e_value'
+                            })
+                            existing_links.add((mediator_col, outcome_col))
+
                 else:
                     print(f"Inconclusive mediation for mediator {mediator_col} (no valid bootstrap)")
         else:
             print("Mediation not run: no available mediator with sufficient variance")
     else:
         print("Mediation not run (missing cause/outcome)")
+
+    # Printing causal model (now including rescued links)
+    if all_links:
+        print("\nE-values du modèle final (incluant repêchages par médiation)")
+        
+        final_df = pd.DataFrame(all_links)
+        # Standardize target names for survival
+        final_df['to'] = final_df['to'].replace(['OS', 'OS_months', 'OS_event'], 'Overall_Survival')
+        
+        cols_to_show = ['from', 'to', 'coef', 'p_value', 'e_value', 'e_value_ci', 'method']
+        available_cols = [c for c in cols_to_show if c in final_df.columns]
+        display_df = final_df[available_cols].copy()
+        
+        col_names = {
+            'from': 'Source',
+            'to': 'Cible',
+            'coef': 'Effet',
+            'p_value': 'p-value',
+            'e_value': 'E-value',
+            'e_value_ci': 'E-value_CI',
+            'method': 'Méthode'
+        }
+        display_df = display_df.rename(columns=col_names)
+        sort_keys = [k for k in ['Cible', 'p-value'] if k in display_df.columns]
+        if sort_keys:
+            display_df = display_df.sort_values(sort_keys)
+        print(tabulate(display_df, headers='keys', tablefmt='psql', showindex=False, floatfmt=".4f"))
 
     print("\n" + "=" * 80)
     print("PHASE 4 - EXPORT")
